@@ -18,7 +18,9 @@ def main():
     report = inspect(EXE)
     DIST.mkdir(exist_ok=True)
     artifact = DIST / f"{NAME}.zip"
-    sources = [ROOT / name for name in ("Makefile", "README.md", "VERIFICATION.md", ".gitignore")]
+    sources = [ROOT / name for name in (
+        "Makefile", "README.md", "VERIFICATION.md", ".gitignore", ".github/workflows/ci.yml"
+    )]
     for directory in ("src", "tests", "resources", "tools"):
         sources.extend(path for path in (ROOT / directory).rglob("*")
                        if path.is_file() and path.suffix in {".c", ".h", ".py", ".rc", ".manifest"})

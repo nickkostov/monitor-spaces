@@ -156,6 +156,36 @@ In a sandbox where LeakSanitizer cannot inspect processes, use
 `ASAN_OPTIONS=detect_leaks=0 make test-sanitize`; address and undefined-behavior
 checks remain enabled.
 
+## CI and GitHub Releases
+
+[Build and release](.github/workflows/ci.yml) runs on branch pushes, pull requests,
+version-tag pushes, and manual runs. It runs the native sanitizer checks, builds
+the Windows x64 executable, inspects its format/imports, creates the ZIP, and
+verifies its checksum. Successful builds save the package and checksum as the
+`windows-x64-package` Actions artifact for 14 days.
+
+After committing and pushing the changes you want to release, push an unused
+version tag:
+
+```sh
+git tag -a v1.0.0 -m "Monitor Spaces v1.0.0"
+git push origin v1.0.0
+```
+
+A successful `v*` tag build automatically creates a GitHub Release with:
+
+- `monitor-spaces-windows-x64.zip`: executable, source, resources, tests, build
+  instructions, workflow, and executable inspection report.
+- `monitor-spaces-windows-x64.zip.sha256`: SHA-256 checksum of that ZIP.
+
+Tags containing a hyphen, such as `v1.1.0-rc.1`, create prereleases. Branch pushes,
+pull requests, and manual runs build artifacts without publishing releases.
+The release stays a draft until both assets are uploaded. Rerunning a failed job
+can resume an unfinished draft; published releases and assets are left unchanged.
+The workflow uses GitHub's built-in token, with release-write permission limited
+to the publishing job. No additional repository secret is required. The executable
+remains unsigned, and CI does not validate live Windows desktop behavior.
+
 ## Build on Windows with MSYS2
 
 In the **MSYS2 MINGW64** shell, install the toolchain and build:

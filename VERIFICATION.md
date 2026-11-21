@@ -60,6 +60,19 @@ the inspected executable. `BUILD-INFO.json` inside the ZIP records the executabl
 size, SHA-256, architecture, subsystem, imports, and security/DPI flags. An adjacent
 `.zip.sha256` file records the ZIP checksum.
 
+## CI and release checks
+
+`.github/workflows/ci.yml` runs sanitizer checks and `make package` on Ubuntu 24.04,
+then verifies the generated ZIP checksum before saving it as an Actions artifact.
+Only successful `v*` tag pushes enter the publishing job, which verifies the
+downloaded ZIP checksum again and attaches the ZIP and checksum to a GitHub Release.
+Release creation uses a draft until uploads succeed, supports resuming unfinished
+drafts, and leaves published releases unchanged. Prerelease tags contain a hyphen.
+
+The workflow can be checked locally with `actionlint .github/workflows/ci.yml`.
+Live execution on GitHub still requires pushing the workflow; actual release
+publication requires a version-tag push. These checks do not execute the GUI.
+
 ## Live Windows checklist — not yet performed
 
 Use two physical displays and ordinary test windows with no unsaved work:
