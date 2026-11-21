@@ -65,11 +65,15 @@ bool ms_switch(MSState *state, MSHandle monitor, unsigned destination,
     if (source == destination)
         return true;
 
-    /* First tag ALL departing windows, before hiding any owner or popup. */
+    /* Minimized inactive windows are still WS_VISIBLE and remain in the taskbar.
+     * Their existing membership must survive switches through other workspaces. */
+    /* First tag ALL departing windows, before hiding/minimizing any owner. */
     for (size_t i = 0; i < count; ++i) {
         MSWindow *window = &windows[i];
         window->prepared = false;
         if (window->monitor != monitor || !window->visible || !window->eligible)
+            continue;
+        if (ms_valid_tag(window->tag) && window->tag != source)
             continue;
         if (!ops->set_tag(ops->context, window->id, source)) {
             ++result->errors;

@@ -35,6 +35,7 @@ typedef struct {
     void *context;
     bool (*set_tag)(void *, MSHandle, unsigned);
     bool (*clear_tag)(void *, MSHandle);
+    /* Remove from the desktop; minimizing may leave MSWindow.visible true. */
     bool (*hide)(void *, MSHandle);
     bool (*show)(void *, MSHandle);
 } MSOperations;

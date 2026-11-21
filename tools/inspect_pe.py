@@ -73,7 +73,10 @@ def inspect(path: Path) -> dict:
                       "RegisterHotKey", "UnregisterHotKey", "DwmGetWindowAttribute",
                       "SetWindowsHookExW", "UnhookWindowsHookEx", "CallNextHookEx", "SendInput",
                       "Shell_NotifyIconW", "CreateIconIndirect", "DestroyIcon", "CreatePopupMenu",
-                      "TrackPopupMenu", "RegisterWindowMessageW"}
+                      "TrackPopupMenu", "RegisterWindowMessageW", "ShowWindow",
+                      "IsIconic", "IsZoomed", "GetForegroundWindow", "DwmSetWindowAttribute",
+                      "DwmFlush", "SetWindowDisplayAffinity", "BitBlt", "UpdateLayeredWindow",
+                      "QueryPerformanceCounter", "QueryPerformanceFrequency"}
     require(workspace_apis <= functions, "Missing expected workspace API imports")
     require(any(name == ".rsrc" for name, *_ in sections), "Missing resource section")
     require("PerMonitorV2".encode() in data, "Missing per-monitor DPI manifest")

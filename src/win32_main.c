@@ -18,10 +18,15 @@
 
 #include "workspaces.h"
 #include "navigation.h"
+#include "slide.h"
+#include "transition_win32.h"
 
 /* Store an integer, never a pointer into this process. The property stays on
  * the foreign HWND if this utility is killed. Keep this key stable in updates. */
 static const wchar_t TAG_KEY[] = L"MonitorSpaces.HiddenWorkspace.v1.{52617889-437D-4910-B50A-70607E152BC2}";
+/* Numeric original state: SW_SHOWNORMAL, SW_SHOWMINIMIZED, SW_SHOWMAXIMIZED.
+ * An absent property identifies windows hidden by earlier versions. */
+static const wchar_t STATE_KEY[] = L"MonitorSpaces.OriginalState.v1.{52617889-437D-4910-B50A-70607E152BC2}";
 static const wchar_t PANEL_CLASS[] = L"MonitorSpaces.Panel.v1";
 static const wchar_t MUTEX_NAME[] = L"Local\\MonitorSpaces.Instance.v1";
 
@@ -416,8 +421,23 @@ static bool set_tag(void *context, MSHandle handle, unsigned workspace)
 {
     (void)context;
     HWND window = (HWND)handle;
-    /* UIPI may deny SetProp for elevated apps. Never hide without a tag. */
-    return eligible(window) && SetPropW(window, TAG_KEY, (HANDLE)(ULONG_PTR)workspace);
+    /* Save every owner's and popup's state before minimizing any window. Never
+     * overwrite a saved state when retrying a failed minimize/tag removal. */
+    if (!eligible(window))
+        return false;
+    bool tagged = ms_valid_tag(window_tag(window));
+    if (!tagged) {
+        unsigned state = IsIconic(window) ? SW_SHOWMINIMIZED :
+                         IsZoomed(window) ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+        if (!SetPropW(window, STATE_KEY, (HANDLE)(ULONG_PTR)state))
+            return false;
+    }
+    /* UIPI may deny property writes. Never minimize without a recovery tag. */
+    if (SetPropW(window, TAG_KEY, (HANDLE)(ULONG_PTR)workspace))
+        return true;
+    if (!tagged)
+        RemovePropW(window, STATE_KEY);
+    return false;
 }
 
 static bool clear_tag(void *context, MSHandle handle)
@@ -427,35 +447,53 @@ static bool clear_tag(void *context, MSHandle handle)
     if (!IsWindow(window))
         return true;
     RemovePropW(window, TAG_KEY);
-    return GetPropW(window, TAG_KEY) == NULL;
-}
-
-static bool change_visibility(MSHandle handle, bool show)
-{
-    HWND window = (HWND)handle;
-    if (!IsWindow(window))
-        return true;
-    if (!ms_valid_tag(window_tag(window)))
+    if (GetPropW(window, TAG_KEY) != NULL)
         return false;
-    /* Synchronous completion lets us verify visibility before removing the
-     * recovery tag. Do not change geometry, Z order, focus, or min/max state.
-     * An unresponsive application can delay this call (see README). */
-    BOOL changed = SetWindowPos(window, NULL, 0, 0, 0, 0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER |
-        SWP_NOACTIVATE | SWP_NOSENDCHANGING | (show ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
-    return !IsWindow(window) || (changed && (IsWindowVisible(window) != FALSE) == show);
+    RemovePropW(window, STATE_KEY);
+    return true;
 }
 
 static bool hide_window(void *context, MSHandle handle)
 {
     (void)context;
-    return change_visibility(handle, false);
+    HWND window = (HWND)handle;
+    if (!IsWindow(window))
+        return true;
+    if (!ms_valid_tag(window_tag(window)))
+        return false;
+    /* WS_VISIBLE stays set, preserving real taskbar buttons and Alt+Tab entries.
+     * ShowWindow's return value is previous visibility, not success. */
+    if (!IsIconic(window))
+        ms_show_without_animation(window, SW_SHOWMINNOACTIVE);
+    return !IsWindow(window) || IsIconic(window);
 }
 
 static bool show_window(void *context, MSHandle handle)
 {
     (void)context;
-    return change_visibility(handle, true);
+    HWND window = (HWND)handle;
+    if (!IsWindow(window))
+        return true;
+    if (!ms_valid_tag(window_tag(window)))
+        return false;
+    unsigned state = (unsigned)(ULONG_PTR)GetPropW(window, STATE_KEY);
+    if (state < SW_SHOWNORMAL || state > SW_SHOWMAXIMIZED) {
+        /* Recover legacy releases' hidden windows without changing min/max. */
+        BOOL changed = SetWindowPos(window, NULL, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER |
+            SWP_NOACTIVATE | SWP_NOSENDCHANGING | SWP_SHOWWINDOW);
+        return !IsWindow(window) || (changed && IsWindowVisible(window));
+    }
+    if (state == SW_SHOWMINIMIZED) {
+        /* Leave originally minimized windows alone. A taskbar/Alt+Tab selection
+         * may already have restored one; do not minimize the selected app again. */
+        if (!IsWindowVisible(window))
+            ms_show_without_animation(window, IsIconic(window) ? SW_SHOWMINNOACTIVE : SW_SHOWNA);
+    } else if (IsIconic(window) || !IsWindowVisible(window)) {
+        ms_show_without_animation(window, state == SW_SHOWMAXIMIZED ? SW_SHOWMAXIMIZED : SW_SHOWNOACTIVATE);
+    }
+    return !IsWindow(window) || (IsWindowVisible(window) &&
+        (state == SW_SHOWMINIMIZED || !IsIconic(window)));
 }
 
 static const MSOperations OPERATIONS = {NULL, set_tag, clear_tag, hide_window, show_window};
@@ -543,6 +581,7 @@ static void update_panel(void)
 
 static MSResult recover_windows(void)
 {
+    ms_transition_cancel();
     Windows windows;
     MSResult result = {0};
     if (!snapshot_windows(&windows)) {
@@ -587,6 +626,42 @@ static bool sync_displays(void)
     return !g_recovery_needed;
 }
 
+static void switch_on_monitor(HMONITOR target, unsigned workspace, int navigation)
+{
+    if (ms_active(&g_state, (MSHandle)target) == workspace) {
+        swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
+            L"The display under the pointer is already on workspace %u.", workspace);
+        return;
+    }
+    Windows windows;
+    if (!snapshot_windows(&windows)) {
+        wcscpy(g_message, L"Could not enumerate windows. No windows changed.");
+        return;
+    }
+    MSResult result;
+    HWND foreground = GetForegroundWindow();
+    int direction = ms_slide_direction(ms_active(&g_state, (MSHandle)target), workspace, navigation);
+    ms_transition_begin(target, direction);
+    bool valid = ms_switch(&g_state, (MSHandle)target, workspace,
+                           windows.items, windows.count, &OPERATIONS, &result);
+    free(windows.items);
+    /* Maximizing a restored app can activate it. Preserve a selected app or
+     * focus on another monitor, provided it was not just minimized by us. */
+    if (IsWindow(foreground) && IsWindowVisible(foreground) && !IsIconic(foreground))
+        SetForegroundWindow(foreground);
+    if (!valid) {
+        ms_transition_cancel();
+        g_topology_dirty = true;
+        wcscpy(g_message, L"The target display changed. Retry after display recovery.");
+        return;
+    }
+    ms_transition_commit();
+    swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
+        L"Workspace %u: minimized %zu, restored %zu. %zu errors.%ls",
+        workspace, result.hidden, result.shown, result.errors,
+        result.errors ? L" Some apps could not be managed; Ctrl+Alt+0 retries recovery." : L"");
+}
+
 static void switch_at_pointer(unsigned workspace, int direction)
 {
     if (!sync_displays())
@@ -599,29 +674,28 @@ static void switch_at_pointer(unsigned workspace, int direction)
     HMONITOR target = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
     if (direction)
         workspace = ms_adjacent(&g_state, (MSHandle)target, direction);
-    if (ms_active(&g_state, (MSHandle)target) == workspace) {
-        swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
-            L"The display under the pointer is already on workspace %u.", workspace);
+    switch_on_monitor(target, workspace, direction);
+}
+
+static void follow_foreground(void)
+{
+    /* Taskbar and Alt+Tab can restore an inactive app. Follow its membership,
+     * using the app's monitor rather than the pointer's. Poll current focus so
+     * queued activation events from our own minimize/restore calls are ignored. */
+    HWND window = GetForegroundWindow();
+    unsigned workspace = window_tag(window);
+    if (!ms_valid_tag(workspace) || IsIconic(window) || !IsWindowVisible(window))
         return;
-    }
-    Windows windows;
-    if (!snapshot_windows(&windows)) {
-        wcscpy(g_message, L"Could not enumerate windows. No windows changed.");
+    if (!sync_displays())
         return;
-    }
-    MSResult result;
-    bool valid = ms_switch(&g_state, (MSHandle)target, workspace,
-                           windows.items, windows.count, &OPERATIONS, &result);
-    free(windows.items);
-    if (!valid) {
-        g_topology_dirty = true;
-        wcscpy(g_message, L"The target display changed. Retry after display recovery.");
+    workspace = window_tag(window); /* Display recovery may have cleared it. */
+    if (!ms_valid_tag(workspace) || window != GetForegroundWindow())
         return;
+    HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+    if (ms_active(&g_state, (MSHandle)monitor) != workspace) {
+        switch_on_monitor(monitor, workspace, 0);
+        update_panel();
     }
-    swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
-        L"Workspace %u: hid %zu, restored %zu. %zu errors.%ls",
-        workspace, result.hidden, result.shown, result.errors,
-        result.errors ? L" Some apps could not be managed; Ctrl+Alt+0 retries recovery." : L"");
 }
 
 static int px(int value)
@@ -724,11 +798,15 @@ static LRESULT CALLBACK panel_proc(HWND window, UINT message, WPARAM wparam, LPA
         update_panel();
         return 0;
     case WM_DISPLAYCHANGE:
+        ms_transition_cancel();
         g_topology_dirty = true;
         return 0;
     case WM_TIMER:
         if (wparam == TIMER_INDICATOR && !g_busy) {
+            g_busy = true;
+            follow_foreground();
             update_tray();
+            g_busy = false;
             return 0;
         }
         if (wparam == TIMER_TOPOLOGY && !g_busy) {
