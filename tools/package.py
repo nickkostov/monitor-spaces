@@ -42,11 +42,15 @@ def main():
             raise RuntimeError("ZIP integrity check failed")
         if archive.read(f"{NAME}/MonitorSpaces.exe") != EXE.read_bytes():
             raise RuntimeError("Packaged executable does not match inspected executable")
-    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-    checksum = DIST / f"{NAME}.zip.sha256"
-    checksum.write_text(f"{digest}  {artifact.name}\n", encoding="ascii")
+    executable = DIST / EXE.name
+    executable.write_bytes(EXE.read_bytes())
+    for asset in (executable, artifact):
+        digest = hashlib.sha256(asset.read_bytes()).hexdigest()
+        checksum = asset.with_name(asset.name + ".sha256")
+        checksum.write_text(f"{digest}  {asset.name}\n", encoding="ascii")
+        print(f"SHA-256 ({asset.name}): {digest}")
+    print(f"Standalone executable: {executable.relative_to(ROOT)}")
     print(f"Packaged {artifact.relative_to(ROOT)} ({artifact.stat().st_size:,} bytes)")
-    print(f"SHA-256: {digest}")
 
 
 if __name__ == "__main__":

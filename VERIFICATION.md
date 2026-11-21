@@ -5,7 +5,7 @@ without launching it on the host's Windows desktop.
 
 ## Automated checks completed
 
-`make test` compiles `src/workspaces.c` with the native C compiler and runs nine
+`make test` compiles `src/workspaces.c` with the native C compiler and runs ten
 workspace simulation scenarios against the same workspace engine linked into the GUI:
 
 1. Two monitors switch independently; a window opened in workspace 2 returns
@@ -28,6 +28,10 @@ workspace simulation scenarios against the same workspace engine linked into the
 9. Previous/next navigation wraps between workspaces 1 and 4, visits intermediate
    workspaces in both directions, restores their windows, and leaves the other
    monitor's state and windows independent.
+10. Inactive windows that retain `WS_VISIBLE` (as minimization does) keep their
+    original membership across all four workspaces. Selecting another workspace
+    reveals only its tagged windows, leaves the other monitor independent, and
+    recovery after process-state loss still clears every inactive membership.
 
 `make test` also compiles `src/navigation.c` and exercises input sequences for
 both Win keys, left/right navigation, repeat suppression, release order, overlapping
@@ -35,6 +39,21 @@ arrow presses, and holding both Win keys. Plain arrows, other Win shortcuts,
 extra Ctrl/Alt/Shift modifiers, and arrows held before Win pass through.
 Shell menu masking is requested once per Win hold. These are state-machine tests;
 the Win32 hook and synthetic input are not executed in this simulation.
+
+`tests/test_slide.c` exercises the exact frame calculations used by the overlay:
+left/right wraparound, direct numbered selection, monotonic progress, no gaps
+between outgoing/incoming images, and exact endpoints. Widths include odd sizes,
+HD/4K/8K, and `INT_MAX`; elapsed time beyond the duration is clamped. This validates
+slide geometry, not Windows capture, painting, or animation smoothness.
+
+The renderer now submits whole frames with `UpdateLayeredWindow`, measures elapsed
+time with `QueryPerformanceCounter`, and uses `DwmFlush` presentation pacing
+instead of a 16 ms `WM_TIMER`. Workspace state changes share one DWM barrier
+before restoring per-window transition settings. A shortcut during an active
+slide on the same monitor reuses the displayed frame without removing the overlay;
+generation checks discard stale frame messages. These changes address identified
+sources of uneven pacing; the reported visual stutter is not considered verified
+fixed without testing the updated executable on Windows.
 
 AddressSanitizer and UndefinedBehaviorSanitizer passed with
 `ASAN_OPTIONS=detect_leaks=0 make test-sanitize`. LeakSanitizer's process inspection
@@ -58,15 +77,19 @@ the installed cross-compiler toolchain.
 The ZIP creation checks its CRCs and verifies that the packaged executable equals
 the inspected executable. `BUILD-INFO.json` inside the ZIP records the executable
 size, SHA-256, architecture, subsystem, imports, and security/DPI flags. An adjacent
-`.zip.sha256` file records the ZIP checksum.
+`.zip.sha256` file records the ZIP checksum. Packaging also copies the inspected
+executable to `dist/MonitorSpaces.exe` and writes `dist/MonitorSpaces.exe.sha256`
+for standalone download.
 
 ## CI and release checks
 
 `.github/workflows/ci.yml` runs sanitizer checks and `make package` on Ubuntu 24.04,
-then verifies the generated ZIP checksum before saving it as an Actions artifact.
+then verifies the EXE and ZIP checksums before saving them as an Actions artifact.
 Only successful `v*` tag pushes enter the publishing job, which verifies the
-downloaded ZIP checksum again and attaches the ZIP and checksum to a GitHub Release.
-Release creation uses a draft until uploads succeed, supports resuming unfinished
+downloaded checksums again and attaches the EXE, ZIP, and both checksum files to a
+GitHub Release. A prominent link at the top of the release notes downloads the
+standalone EXE for that release's tag; the ZIP and checksum files are linked too.
+Release creation uses a draft until all four uploads succeed, supports resuming unfinished
 drafts, and leaves published releases unchanged. Prerelease tags contain a hyphen.
 
 The workflow can be checked locally with `actionlint .github/workflows/ci.yml`.
@@ -79,7 +102,8 @@ Use two physical displays and ordinary test windows with no unsaved work:
 
 1. Start the utility; it should remain in the background with a numbered tray
    icon, and both displays must start on workspace 1. Point at the first
-   display without clicking and switch to workspace 2. Its windows should hide;
+   display without clicking and switch to workspace 2. Its windows should minimize
+   while remaining in the taskbar and Alt+Tab;
    the second display's windows and workspace number should stay unchanged.
 2. Open a window on workspace 2. Switch the other display to workspace 3, then
    switch the first back to workspace 1. Confirm each display retains its windows.
@@ -89,9 +113,10 @@ Use two physical displays and ordinary test windows with no unsaved work:
    panel and tray menu. Every tagged window should return; all active workspace
    numbers should reset to 1. Closing or minimizing the panel must instead hide it
    and preserve the current workspaces and shortcut handling.
-4. Hide windows, end MonitorSpaces.exe using Task Manager, and relaunch it.
-   Verify recovery before shortcuts become available. Repeat with `--restore`.
-5. Hide windows, unplug a display, change resolution/position/primary display,
+4. Switch away from windows, end MonitorSpaces.exe using Task Manager, and relaunch
+   it. Verify recovery before shortcuts become available. Repeat with `--restore`
+   and with windows hidden by the previous release to verify legacy recovery.
+5. Minimize windows by switching, unplug a display, change resolution/position/primary display,
    reconnect it, and test logoff/shutdown. Confirm recovery and workspace resets.
 6. Test 100%, 150%, and 200% scaling, displays with negative coordinates, a window
    spanning displays, and moving the panel between DPI settings.
@@ -100,7 +125,7 @@ Use two physical displays and ordinary test windows with no unsaved work:
    Windows Task View desktop. Pay particular attention to owner/popup pairs spanning
    displays and apps that change their own visibility or HWNDs.
 8. Run a test app elevated and verify that denied property writes leave it visible.
-   Test recovery at the same privilege level used to hide the window.
+   Test recovery at the same privilege level used to manage the window.
 9. Reserve one shortcut with another tool before launch. The utility should name
    the unavailable shortcut, release any shortcuts already registered, and exit.
 10. Launch a second copy; it should reveal the existing panel. A second copy with
@@ -122,9 +147,37 @@ Use two physical displays and ordinary test windows with no unsaved work:
     Launch with `--panel`; launch a second copy while the first is hidden. Restart
     Explorer and verify the icon returns. Verify icon removal and window recovery
     on explicit exit and session shutdown, and panel fallback if the tray is absent.
+14. Keep apps on all four workspaces and verify their taskbar buttons and Alt+Tab
+    entries remain available. Select an inactive app from each and confirm its
+    monitor switches to its workspace within 250 ms, including when the pointer
+    is on the other monitor. Check that the selected app keeps focus, maximized
+    windows return maximized, and previously minimized windows stay minimized
+    until explicitly selected. Repeat after killing/relaunching the utility, with
+    grouped taskbar buttons, modal dialogs, and apps that minimize to the tray.
+15. Switch in both directions, including 1↔4 wraparound and direct numbered
+    shortcuts. Confirm a horizontal slide replaces the minimize/restore effect,
+    the taskbar/other monitor remain stationary, and normal/maximized window
+    positions stay unchanged. Test negative monitor coordinates, mixed DPI,
+    empty workspaces, and protected/video content. Rapidly switch/reverse, then
+    restore, exit, kill the process, or change display settings mid-slide. No
+    overlay should remain, input must pass through, and recovery must still work.
+    Turn Windows animations off, test RDP and Windows 10 before version 2004,
+    and verify instant switching. Watch GDI handles/memory during repeated
+    switching and after cancellation. Compare per-app native animations before
+    and after switching and exiting; global animation settings must not change.
+    Specifically compare sustained frame cadence on 60/120/144 Hz displays and
+    mixed refresh-rate setups, with many apps and under load. Confirm every slide
+    presents the final incoming frame before removing the overlay, repeated
+    shortcuts do not flash the underlying desktop, and input/recovery stay usable.
 
 These simulations do not validate Windows message delivery, actual property
 lifetime after process termination, application responsiveness, focus behavior,
 or driver/DPI behavior. Tray drawing, visibility, mouse/keyboard callbacks, Explorer
 restart recovery, and background panel behavior require live Windows validation.
+The new minimize/restore calls, original-state properties, taskbar retention, and
+foreground polling also require live Windows validation; engine simulations do
+not execute these Win32 calls.
+The slide overlay, capture exclusion, per-window DWM transition suppression,
+reduced-motion fallback, resource cleanup, and interruption behavior have been
+reviewed in source and cross-compiled but still require live Windows validation.
 The packaged executable is unsigned.

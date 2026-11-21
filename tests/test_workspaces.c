@@ -13,6 +13,7 @@ typedef struct {
     MSHandle owner, popup;
     size_t mutations;
     bool require_all_tagged;
+    bool keep_visible; /* Minimization preserves the Win32 WS_VISIBLE style. */
 } Desktop;
 
 static MSWindow *find(Desktop *desktop, MSHandle id)
@@ -66,7 +67,7 @@ static bool hide(void *context, MSHandle id)
             assert(ms_valid_tag(desktop->windows[i].tag));
     if (desktop->fail_hide == id)
         return false;
-    window->visible = false;
+    window->visible = desktop->keep_visible;
     if (desktop->owner == id)
         find(desktop, desktop->popup)->visible = false;
     return true;
@@ -311,6 +312,42 @@ static void monitor_validation(void)
     puts("PASS monitor validation and supported monitor limit");
 }
 
+static void taskbar_windows_keep_membership(void)
+{
+    Desktop desktop = {.keep_visible = true};
+    MSState state = start();
+    MSHandle apps[MS_WORKSPACE_COUNT];
+    MSHandle other = open_window(&desktop, RIGHT, true, true);
+    apps[0] = open_window(&desktop, LEFT, true, true);
+    for (unsigned workspace = 2; workspace <= MS_WORKSPACE_COUNT; ++workspace) {
+        MSResult result = switch_to(&state, &desktop, LEFT, workspace);
+        assert(result.hidden == 1 && !result.errors);
+        apps[workspace - 1] = open_window(&desktop, LEFT, true, true);
+    }
+    /* All remain visible to Windows/taskbar, with independent membership. */
+    for (unsigned i = 0; i < MS_WORKSPACE_COUNT; ++i) {
+        assert(find(&desktop, apps[i])->visible);
+        assert(find(&desktop, apps[i])->tag == (i == 3 ? 0 : i + 1));
+    }
+    /* Selecting an inactive app targets its workspace and its monitor, even
+     * when all other inactive apps also have WS_VISIBLE. */
+    MSWindow *selected = find(&desktop, apps[1]);
+    MSResult result = switch_to(&state, &desktop, selected->monitor, selected->tag);
+    assert(result.hidden == 1 && result.shown == 1 && !result.errors);
+    assert(!selected->tag && ms_active(&state, LEFT) == 2);
+    assert(find(&desktop, apps[0])->tag == 1);
+    assert(find(&desktop, apps[2])->tag == 3);
+    assert(find(&desktop, apps[3])->tag == 4);
+    assert(ms_active(&state, RIGHT) == 1 && !find(&desktop, other)->tag);
+    /* Process memory loss must still recover every inactive membership. */
+    memset(&state, 0, sizeof(state));
+    result = restore(&state, &desktop);
+    assert(result.shown == 3 && !result.errors);
+    for (unsigned i = 0; i < MS_WORKSPACE_COUNT; ++i)
+        assert(find(&desktop, apps[i])->visible && !find(&desktop, apps[i])->tag);
+    puts("PASS taskbar-visible inactive windows retain membership across all workspaces and recovery");
+}
+
 static void relative_navigation_wraps_per_monitor(void)
 {
     Desktop desktop = {0};
@@ -354,6 +391,7 @@ int main(void)
     owner_side_effects_use_a_complete_snapshot();
     moved_windows_and_monitor_reset();
     monitor_validation();
+    taskbar_windows_keep_membership();
     relative_navigation_wraps_per_monitor();
     puts("All workspace simulations passed.");
     return 0;

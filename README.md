@@ -8,12 +8,27 @@ and use a shortcut to switch just that display. Every monitor starts on workspac
 | Win + Left | Previous workspace on the monitor under the pointer; workspace 1 wraps to 4 |
 | Win + Right | Next workspace on the monitor under the pointer; workspace 4 wraps to 1 |
 | Ctrl + Alt + 1–4 | Switch the monitor under the pointer to workspace 1–4 |
-| Ctrl + Alt + 0 | Restore every window hidden by Monitor Spaces; reset all monitors to workspace 1 |
+| Ctrl + Alt + 0 | Restore all managed windows; reset all monitors to workspace 1 |
 | Restore all button | Same as Ctrl + Alt + 0 |
 | Numbered tray icon | Show the workspace on the monitor under the pointer; click to open the panel |
 | Right-click tray icon | Open the panel, restore windows, or restore and exit |
 | Close / minimize panel | Hide the panel and keep running in the background |
 | Restore and exit | Restore managed windows, remove the tray icon, unregister shortcuts, exit |
+
+All open apps keep their normal Windows taskbar buttons and Alt+Tab entries in
+every workspace. Inactive windows are minimized. Select an app in the taskbar or
+Alt+Tab to switch its monitor to that app's workspace (within 250 ms), regardless
+of where the pointer is. Windows you had already minimized stay minimized when
+switching back, unless you select them yourself.
+
+Workspace changes use a 400 ms horizontal slide across the selected monitor's
+work area. Left/right shortcuts keep their direction when wrapping between 1
+and 4; direct numbered shortcuts slide toward the selected number. The taskbar
+stays stationary, and another shortcut interrupts the current slide. The utility
+suppresses native minimize/restore transitions while changing window states.
+Frames use a high-resolution clock, complete layered-window updates, and DWM
+presentation pacing. Repeated shortcuts continue from the currently displayed
+image; window-state changes share a composition barrier across the workspace.
 
 Use the number row above the letters. The numeric keypad is not registered.
 The app starts in the background. A small number (1–4) in the taskbar's notification
@@ -63,35 +78,52 @@ exits. **Restore and exit** removes the hook and restores normal key handling.
 - A switch uses `GetCursorPos` and `MonitorFromPoint`, so selecting a monitor does
   not require clicking a window. Spanning windows belong to the monitor with
   the largest intersection, as reported by `MonitorFromWindow`.
-- Visible, eligible top-level windows on the departing workspace get a numeric
-  recovery property before any are hidden. Newly opened windows join the active
-  workspace when you leave it. Hidden windows tagged for the destination reappear.
+- Visible, eligible top-level windows on the departing workspace get numeric
+  recovery and original-state properties before any are minimized. Newly opened
+  windows join the active workspace when you leave it. Inactive windows retain
+  their membership even though minimized windows are still visible to Windows.
 - The panel, desktop, taskbars, known shell surfaces, child windows, no-activate
   surfaces, and DWM-cloaked windows are excluded. Owned dialogs and ordinary tool
   windows participate. Explorer folder windows participate too.
-- Complete snapshots and tagging before hiding protect owned dialogs from an
+- Complete snapshots and tagging before minimizing protect owned dialogs from an
   owner's implicit hide. Reveals run in reverse enumeration order to bring owners
   back before their popups.
-- `SetWindowPos` toggles visibility while requesting no geometry, Z-order, or
-  focus change. Minimized and maximized state is left in place. Windows and apps
-  still control their own activation and visibility behavior.
+- `ShowWindow(SW_SHOWMINNOACTIVE)` minimizes inactive windows without requesting
+  activation. Returning restores their normal/maximized state; windows that were
+  already minimized stay minimized. Maximized restores can activate a window;
+  the utility requests focus back for a previously focused, unminimized window.
+  Windows and apps still control their own activation and visibility behavior.
 - Windows hidden by their applications without a Monitor Spaces tag stay hidden.
-  Windows that close while hidden are simply gone. There is no session persistence
+  Windows that close while inactive are simply gone. There is no session persistence
   across logoff or reboot.
 
-These workspaces use window visibility. Applications keep running while hidden;
+These workspaces use window minimization. Applications keep running while inactive;
 Windows Task View desktops and application-specific workspace features are separate.
 A visible window dragged to another display joins that display's active workspace
-on its next switch. A hidden window's current monitor determines where its numbered
+on its next switch. An inactive window's current monitor determines where its numbered
 workspace is revealed.
+
+The slide uses temporary before/after screen snapshots in a click-through,
+non-activating overlay, without moving application windows. Snapshots stay in
+memory and are freed when the slide finishes or is canceled. Recovery, exit,
+and display changes remove the overlay. Animation requires Windows 10 version
+2004 or later and respects Windows' client-area animation setting. Remote sessions,
+capture/allocation failures, and work areas over 16 million pixels use an instant
+switch. Screenshots may omit protected content, and the overlay is excluded from
+screen capture. Per-window DWM transition settings are restored after the batch
+of state changes (to the default when the existing value cannot be queried); global Windows
+animation preferences are never changed. Apps selected through the taskbar may
+start their own restore animation before foreground polling detects the selection.
 
 ## Recovery
 
 The stable, namespaced `MonitorSpaces.HiddenWorkspace.v1` window property stores
 an integer from 1 to 4 on the foreign window itself. It contains no pointer into
 the utility's memory, so surviving windows can be found after an unexpected exit.
-The tag is written before hiding and removed only after visibility is confirmed.
-Failed operations retain their tags for recovery.
+The tag is written before minimizing and removed only after restoration is confirmed.
+`MonitorSpaces.OriginalState.v1` stores the original normal/minimized/maximized
+state as another integer property. Failed operations retain their tags for recovery.
+Startup also restores windows hidden by older versions that lack the state property.
 
 Recovery scans all tagged top-level windows, including ones no longer eligible
 or attached to the original monitor. It runs at startup, on Ctrl + Alt + 0, on
@@ -112,7 +144,7 @@ running panel for results. Standalone recovery returns 0 on success and 1 on err
 
 If recovery fails, switching pauses after startup or a display change until you
 retry recovery successfully. A final failed recovery reports a warning on exit.
-Run recovery at the same privilege level as the run that hid the windows.
+Run recovery at the same privilege level as the run that managed the windows.
 
 ## Build on Linux / WSL
 
@@ -130,6 +162,8 @@ Outputs:
 
 ```text
 build/MonitorSpaces.exe
+dist/MonitorSpaces.exe
+dist/MonitorSpaces.exe.sha256
 dist/monitor-spaces-windows-x64.zip
 dist/monitor-spaces-windows-x64.zip.sha256
 ```
@@ -161,7 +195,7 @@ checks remain enabled.
 [Build and release](.github/workflows/ci.yml) runs on branch pushes, pull requests,
 version-tag pushes, and manual runs. It runs the native sanitizer checks, builds
 the Windows x64 executable, inspects its format/imports, creates the ZIP, and
-verifies its checksum. Successful builds save the package and checksum as the
+verifies both checksums. Successful builds save the EXE, ZIP, and checksums as the
 `windows-x64-package` Actions artifact for 14 days.
 
 After committing and pushing the changes you want to release, push an unused
@@ -174,13 +208,16 @@ git push origin v1.0.0
 
 A successful `v*` tag build automatically creates a GitHub Release with:
 
+- `MonitorSpaces.exe`: the standalone executable, linked prominently at the top
+  of the release notes for direct download.
+- `MonitorSpaces.exe.sha256`: SHA-256 checksum of the executable.
 - `monitor-spaces-windows-x64.zip`: executable, source, resources, tests, build
   instructions, workflow, and executable inspection report.
 - `monitor-spaces-windows-x64.zip.sha256`: SHA-256 checksum of that ZIP.
 
 Tags containing a hyphen, such as `v1.1.0-rc.1`, create prereleases. Branch pushes,
 pull requests, and manual runs build artifacts without publishing releases.
-The release stays a draft until both assets are uploaded. Rerunning a failed job
+The release stays a draft until all four assets are uploaded. Rerunning a failed job
 can resume an unfinished draft; published releases and assets are left unchanged.
 The workflow uses GitHub's built-in token, with release-write permission limited
 to the publishing job. No additional repository secret is required. The executable
@@ -219,13 +256,14 @@ an error. Ctrl + Alt + 1–4 remains available for direct selection.
 
 Windows privilege isolation can prevent managing elevated applications. When
 writing a recovery tag is denied, the utility leaves that window visible and
-reports an error. Synchronous visibility calls allow confirmation before tag
+reports an error. Synchronous window-state calls allow confirmation before tag
 removal, but an unresponsive application can delay a switch, recovery, or shutdown.
 
 Windows can automatically hide/show owned popups with their owner, including
 popups on a different monitor. Such application-owned groups may therefore cross
-monitor boundaries. Apps may also show their own hidden windows, create replacement
-windows, or ignore visibility changes; there is no continuous enforcement.
+monitor boundaries. Apps may minimize to their own tray icon, create replacement
+windows, or ignore state changes. Their own taskbar policies still apply. Only
+foreground selection is monitored continuously; background self-restores are not enforced.
 The supported monitor limit is 64. No live Windows or Wine execution was performed
 while producing this release, and the executable is unsigned.
 
@@ -234,6 +272,7 @@ while producing this release, and the executable is unsigned.
 The implementation follows Microsoft's documentation for
 [window properties and UIPI](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setpropw),
 [visibility and positioning](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwindowpos),
+[minimizing and restoring windows](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindow),
 [global shortcuts](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-registerhotkey),
 [low-level keyboard hooks](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelkeyboardproc),
 [notification icons](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shell_notifyiconw),
