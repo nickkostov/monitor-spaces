@@ -10,10 +10,11 @@ MSNavigationAction ms_navigation_key(MSNavigation *state, unsigned key, bool dow
     bool win = state->down[MS_KEY_LWIN] || state->down[MS_KEY_RWIN];
     if (!win)
         state->menu_masked = false;
-    if (key != MS_KEY_LEFT && key != MS_KEY_RIGHT)
+    if (key != MS_KEY_LEFT && key != MS_KEY_RIGHT && key != MS_KEY_UP)
         return action;
 
-    bool *captured = key == MS_KEY_LEFT ? &state->captured_left : &state->captured_right;
+    bool *captured = key == MS_KEY_LEFT ? &state->captured_left :
+                     key == MS_KEY_RIGHT ? &state->captured_right : &state->captured_up;
     if (*captured) {
         /* Swallow repeats and the matching release, even if Win went up first. */
         *captured = down;
@@ -27,7 +28,8 @@ MSNavigationAction ms_navigation_key(MSNavigation *state, unsigned key, bool dow
     if (down && !repeated && win && !extra_modifier) {
         *captured = true;
         action.swallow = true;
-        action.direction = key == MS_KEY_LEFT ? -1 : 1;
+        action.overview = key == MS_KEY_UP;
+        action.direction = key == MS_KEY_UP ? 0 : key == MS_KEY_LEFT ? -1 : 1;
         action.mask_menu = !state->menu_masked;
         state->menu_masked = true;
     }

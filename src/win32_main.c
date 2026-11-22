@@ -20,6 +20,8 @@
 #include "navigation.h"
 #include "slide.h"
 #include "transition_win32.h"
+#include "carousel_win32.h"
+#include "fullscreen_win32.h"
 
 /* Store an integer, never a pointer into this process. The property stays on
  * the foreign HWND if this utility is killed. Keep this key stable in updates. */
@@ -29,11 +31,12 @@ static const wchar_t TAG_KEY[] = L"MonitorSpaces.HiddenWorkspace.v1.{52617889-43
 static const wchar_t STATE_KEY[] = L"MonitorSpaces.OriginalState.v1.{52617889-437D-4910-B50A-70607E152BC2}";
 static const wchar_t PANEL_CLASS[] = L"MonitorSpaces.Panel.v1";
 static const wchar_t MUTEX_NAME[] = L"Local\\MonitorSpaces.Instance.v1";
+static const wchar_t COUNTS_KEY[] = L"Software\\MonitorSpaces\\WorkspaceCounts";
 
-enum { ID_RESTORE = 100, ID_EXIT, ID_SHOW_PANEL,
+enum { ID_RESTORE = 100, ID_EXIT, ID_SHOW_PANEL, ID_FULLSCREEN,
        TIMER_TOPOLOGY = 1, TIMER_INDICATOR, TRAY_ID = 1,
        WM_RECOVER = WM_APP + 1, WM_NAVIGATE, WM_NAVIGATION_ERROR,
-       WM_TRAY, WM_SHOW_PANEL, WM_EXIT };
+       WM_TRAY, WM_SHOW_PANEL, WM_EXIT, DIRECT_WORKSPACES = 4 };
 
 typedef struct {
     HMONITOR handle;
@@ -66,7 +69,7 @@ static const ULONG_PTR MENU_MASK_MARKER = 0x4d535041;
 static bool g_topology_dirty, g_recovery_needed, g_busy;
 static bool g_tray_enabled, g_tray_added, g_tray_version4;
 static UINT g_taskbar_created;
-static HICON g_tray_icons[MS_WORKSPACE_COUNT + 1];
+static HICON g_tray_icons[MS_MAX_WORKSPACES + 1];
 static int g_tray_icon_size;
 static unsigned g_tray_workspace = UINT_MAX;
 static MSHandle g_tray_monitor;
@@ -81,7 +84,7 @@ static void show_panel(void)
 
 static void destroy_tray_icons(void)
 {
-    for (unsigned i = 0; i <= MS_WORKSPACE_COUNT; ++i) {
+    for (unsigned i = 0; i <= MS_MAX_WORKSPACES; ++i) {
         if (g_tray_icons[i])
             DestroyIcon(g_tray_icons[i]);
         g_tray_icons[i] = NULL;
@@ -104,7 +107,7 @@ static HICON number_icon(unsigned workspace, int size)
     /* At most 128 x 128; a monochrome mask uses word-aligned rows. */
     BYTE mask_bits[2048] = {0};
     HBITMAP mask = CreateBitmap(size, size, 1, 1, mask_bits);
-    HFONT font = CreateFontW(-MulDiv(size, 7, 8), 0, 0, 0, FW_BOLD,
+    HFONT font = CreateFontW(-MulDiv(size, workspace >= 10 ? 5 : 7, 8), 0, 0, 0, FW_BOLD,
         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     HICON icon = NULL;
@@ -115,9 +118,11 @@ static HICON number_icon(unsigned workspace, int size)
         HGDIOBJ old_font = SelectObject(dc, font);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
-        wchar_t digit[2] = {workspace ? (wchar_t)(L'0' + workspace) : L'?', 0};
+        wchar_t digit[12] = L"?";
+        if (workspace)
+            swprintf(digit, 12, L"%u", workspace);
         RECT rect = {0, 0, size, size};
-        int drawn = DrawTextW(dc, digit, 1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        int drawn = DrawTextW(dc, digit, -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         GdiFlush();
         /* GDI text rendering does not preserve the DIB's alpha channel. */
         for (int i = 0; i < size * size; ++i)
@@ -151,8 +156,8 @@ static bool update_tray(void)
     for (size_t i = 0; i < g_displays.count; ++i) {
         if (g_displays.items[i].handle == monitor) {
             swprintf(tip, sizeof(tip) / sizeof(tip[0]),
-                L"Monitor Spaces - Display %zu (%ls): workspace %u of 4%ls", i + 1,
-                g_displays.items[i].info.szDevice, workspace,
+                L"Monitor Spaces - Display %zu (%ls): workspace %u of %u%ls", i + 1,
+                g_displays.items[i].info.szDevice, workspace, ms_workspace_count(&g_state, (MSHandle)monitor),
                 g_recovery_needed ? L" - recovery needed" : L"");
             break;
         }
@@ -212,6 +217,8 @@ static void tray_menu(POINT point)
     if (!menu)
         return;
     AppendMenuW(menu, MF_STRING, ID_SHOW_PANEL, L"&Open panel");
+    AppendMenuW(menu, MF_STRING | (ms_fullscreen_enabled() ? MF_CHECKED : MF_UNCHECKED),
+                ID_FULLSCREEN, L"&Full-screen apps and auto-hide taskbar");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, ID_RESTORE, L"&Restore all windows");
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"Restore and e&xit");
@@ -238,7 +245,7 @@ static LRESULT CALLBACK keyboard_proc(int code, WPARAM message, LPARAM parameter
             MSNavigation previous = g_navigation;
             bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
             MSNavigationAction action = ms_navigation_key(&g_navigation, key->vkCode, down);
-            if (action.direction) {
+            if (action.direction || action.overview) {
                 /* A swallowed arrow must not leave the shell seeing Win alone.
                  * A brief Ctrl press masks its Start-menu action. */
                 bool masked = true;
@@ -279,7 +286,7 @@ static DWORD WINAPI keyboard_thread(void *parameter)
     /* Seed side-specific modifiers only. Generic Ctrl/Shift/Alt aliases would
      * otherwise stay latched after a side-specific physical key-up event. */
     const unsigned held_keys[] = {VK_LWIN, VK_RWIN, VK_LSHIFT, VK_RSHIFT,
-        VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU, VK_LEFT, VK_RIGHT};
+        VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU, VK_LEFT, VK_RIGHT, VK_UP};
     for (size_t i = 0; i < sizeof(held_keys) / sizeof(held_keys[0]); ++i)
         g_navigation.down[held_keys[i]] = (GetAsyncKeyState((int)held_keys[i]) & 0x8000) != 0;
     HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, keyboard_proc, (HINSTANCE)parameter, 0);
@@ -334,7 +341,7 @@ static bool start_keyboard(HINSTANCE instance)
 static unsigned window_tag(HWND window)
 {
     ULONG_PTR tag = (ULONG_PTR)GetPropW(window, TAG_KEY);
-    return tag <= MS_WORKSPACE_COUNT ? (unsigned)tag : 0;
+    return tag <= MS_MAX_WORKSPACES ? (unsigned)tag : 0;
 }
 
 static bool shell_class(const wchar_t *name)
@@ -423,12 +430,13 @@ static bool set_tag(void *context, MSHandle handle, unsigned workspace)
     HWND window = (HWND)handle;
     /* Save every owner's and popup's state before minimizing any window. Never
      * overwrite a saved state when retrying a failed minimize/tag removal. */
-    if (!eligible(window))
-        return false;
     bool tagged = ms_valid_tag(window_tag(window));
+    if (!IsWindow(window) || (!tagged && !eligible(window)))
+        return false;
     if (!tagged) {
-        unsigned state = IsIconic(window) ? SW_SHOWMINIMIZED :
-                         IsZoomed(window) ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+        unsigned state = ms_fullscreen_original_state(window);
+        if (IsIconic(window)) state = SW_SHOWMINIMIZED;
+        else if (!state) state = IsZoomed(window) ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
         if (!SetPropW(window, STATE_KEY, (HANDLE)(ULONG_PTR)state))
             return false;
     }
@@ -492,6 +500,7 @@ static bool show_window(void *context, MSHandle handle)
     } else if (IsIconic(window) || !IsWindowVisible(window)) {
         ms_show_without_animation(window, state == SW_SHOWMAXIMIZED ? SW_SHOWMAXIMIZED : SW_SHOWNOACTIVATE);
     }
+    ms_fullscreen_apply(window);
     return !IsWindow(window) || (IsWindowVisible(window) &&
         (state == SW_SHOWMINIMIZED || !IsIconic(window)));
 }
@@ -542,7 +551,7 @@ static bool same_displays(const Displays *left, const Displays *right)
         const Display *a = &left->items[i], *b = &right->items[i];
         if (a->handle != b->handle || wcscmp(a->info.szDevice, b->info.szDevice) ||
             !EqualRect(&a->info.rcMonitor, &b->info.rcMonitor) ||
-            !EqualRect(&a->info.rcWork, &b->info.rcWork) || a->info.dwFlags != b->info.dwFlags)
+            a->info.dwFlags != b->info.dwFlags)
             return false;
     }
     return true;
@@ -562,10 +571,11 @@ static void update_panel(void)
     for (size_t i = 0; i < g_displays.count; ++i) {
         Display *display = &g_displays.items[i];
         int written = swprintf(text + used, sizeof(text) / sizeof(text[0]) - used,
-            L"%lsDisplay %zu: %ls%ls\r\n    Workspace %u of 4   |   %ld x %ld\r\n\r\n",
+            L"%lsDisplay %zu: %ls%ls\r\n    Workspace %u of %u   |   %ld x %ld\r\n\r\n",
             display->handle == pointed ? L"> " : L"  ", i + 1,
             display->info.szDevice, (display->info.dwFlags & MONITORINFOF_PRIMARY) ? L" (primary)" : L"",
             ms_active(&g_state, (MSHandle)display->handle),
+            ms_workspace_count(&g_state, (MSHandle)display->handle),
             display->info.rcMonitor.right - display->info.rcMonitor.left,
             display->info.rcMonitor.bottom - display->info.rcMonitor.top);
         if (written < 0)
@@ -581,6 +591,8 @@ static void update_panel(void)
 
 static MSResult recover_windows(void)
 {
+    ms_fullscreen_suspend();
+    ms_carousel_close();
     ms_transition_cancel();
     Windows windows;
     MSResult result = {0};
@@ -590,6 +602,7 @@ static MSResult recover_windows(void)
         ms_restore(&g_state, windows.items, windows.count, &OPERATIONS, &result);
         free(windows.items);
     }
+    result.errors += ms_fullscreen_restore();
     g_recovery_needed = result.errors != 0;
     if (result.errors)
         swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
@@ -597,8 +610,52 @@ static MSResult recover_windows(void)
             L"use the same privilege level as the previous run.", result.errors);
     else
         swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
-            L"Restored %zu tagged windows. All displays are on workspace 1.", result.shown);
+            L"Restored %zu workspace windows, original app layouts, and taskbar settings. All displays are on workspace 1.", result.shown);
     return result;
+}
+
+static void display_settings_id(const Display *display, wchar_t id[128])
+{
+    for (DWORD index = 0; ; ++index) {
+        DISPLAY_DEVICEW device = {.cb = sizeof(device)};
+        if (!EnumDisplayDevicesW(display->info.szDevice, index, &device, EDD_GET_DEVICE_INTERFACE_NAME))
+            break;
+        if ((device.StateFlags & DISPLAY_DEVICE_ACTIVE) && device.DeviceID[0]) {
+            wcscpy(id, device.DeviceID);
+            return;
+        }
+    }
+    wcscpy(id, display->info.szDevice);
+}
+
+static void load_workspace_counts(void)
+{
+    for (size_t i = 0; i < g_displays.count; ++i) {
+        wchar_t id[128];
+        display_settings_id(&g_displays.items[i], id);
+        DWORD count = 0, bytes = sizeof(count);
+        if (RegGetValueW(HKEY_CURRENT_USER, COUNTS_KEY, id, RRF_RT_REG_DWORD, NULL, &count, &bytes) == ERROR_SUCCESS)
+            ms_set_workspace_count(&g_state, (MSHandle)g_displays.items[i].handle, count);
+    }
+}
+
+static bool save_workspace_count(MSHandle monitor, unsigned count)
+{
+    for (size_t i = 0; i < g_displays.count; ++i) {
+        if ((MSHandle)g_displays.items[i].handle != monitor)
+            continue;
+        wchar_t id[128];
+        display_settings_id(&g_displays.items[i], id);
+        HKEY key;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, COUNTS_KEY, 0, NULL, REG_OPTION_NON_VOLATILE,
+                            KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS)
+            return false;
+        DWORD value = count;
+        LSTATUS status = RegSetValueExW(key, id, 0, REG_DWORD, (const BYTE *)&value, sizeof(value));
+        RegCloseKey(key);
+        return status == ERROR_SUCCESS;
+    }
+    return false;
 }
 
 static bool sync_displays(void)
@@ -619,9 +676,14 @@ static bool sync_displays(void)
         if (!ms_set_monitors(&g_state, ids, displays.count))
             return false;
         g_displays = displays;
+        load_workspace_counts();
         g_topology_dirty = false;
         if (!result.errors)
             wcscpy(g_message, L"Display configuration updated. Windows restored; all workspaces reset to 1.");
+    } else {
+        /* Auto-hide changes rcWork without changing monitors. Keep live work
+         * areas, but do not undo full-screen mode or reset workspace membership. */
+        g_displays = displays;
     }
     return !g_recovery_needed;
 }
@@ -634,6 +696,7 @@ static void switch_on_monitor(HMONITOR target, unsigned workspace, int navigatio
         return;
     }
     Windows windows;
+    ms_fullscreen_update();
     if (!snapshot_windows(&windows)) {
         wcscpy(g_message, L"Could not enumerate windows. No windows changed.");
         return;
@@ -664,6 +727,7 @@ static void switch_on_monitor(HMONITOR target, unsigned workspace, int navigatio
 
 static void switch_at_pointer(unsigned workspace, int direction)
 {
+    ms_carousel_close();
     if (!sync_displays())
         return;
     POINT cursor;
@@ -675,6 +739,183 @@ static void switch_at_pointer(unsigned workspace, int direction)
     if (direction)
         workspace = ms_adjacent(&g_state, (MSHandle)target, direction);
     switch_on_monitor(target, workspace, direction);
+}
+
+static MSHandle window_group(MSHandle handle)
+{
+    HWND root = GetAncestor((HWND)handle, GA_ROOTOWNER);
+    return root ? (MSHandle)root : handle;
+}
+
+static bool carousel_load(MSHandle monitor, MSCarouselItem **items, size_t *count, unsigned *active, unsigned *spaces)
+{
+    *items = NULL;
+    *count = 0;
+    *active = ms_active(&g_state, monitor);
+    *spaces = ms_workspace_count(&g_state, monitor);
+    if (!*active)
+        return false;
+    Windows windows;
+    if (!snapshot_windows(&windows))
+        return false;
+    MSCarouselItem *result = windows.count ? calloc(windows.count, sizeof(*result)) : NULL;
+    if (windows.count && !result) {
+        free(windows.items);
+        return false;
+    }
+    for (size_t i = 0; i < windows.count; ++i) {
+        MSWindow *window = &windows.items[i];
+        if (window->monitor != monitor)
+            continue;
+        DWORD process = 0;
+        if (!GetWindowThreadProcessId((HWND)window->id, &process))
+            continue;
+        MSHandle group = window_group(window->id);
+        size_t index = 0;
+        while (index < *count && window_group(result[index].window) != group)
+            ++index;
+        if (index < *count && window->id != group)
+            continue;
+        if (index == *count)
+            ++*count;
+        result[index].window = window->id;
+        result[index].workspace = ms_valid_tag(window->tag) ? window->tag : *active;
+        result[index].process = process;
+        if (!GetWindowTextW((HWND)window->id, result[index].title, 256))
+            wcscpy(result[index].title, L"Untitled window");
+    }
+    free(windows.items);
+    *items = result;
+    return true;
+}
+
+static bool carousel_move(MSHandle monitor, MSHandle handle, DWORD process, unsigned destination,
+                          wchar_t *message, size_t capacity)
+{
+    DWORD current_process = 0;
+    GetWindowThreadProcessId((HWND)handle, &current_process);
+    if (g_busy || !IsWindow((HWND)handle) || current_process != process) {
+        swprintf(message, capacity, L"That app is no longer available. Press F5 to refresh.");
+        return false;
+    }
+    g_busy = true;
+    if (!sync_displays() || !ms_carousel_visible()) {
+        g_busy = false;
+        return false; /* Display recovery closes the carousel. */
+    }
+    Windows windows;
+    if (!snapshot_windows(&windows)) {
+        swprintf(message, capacity, L"Could not read the app windows. Try again.");
+        g_busy = false;
+        return false;
+    }
+    MSHandle group = window_group(handle);
+    size_t count = 0;
+    bool found = false;
+    for (size_t i = 0; i < windows.count; ++i) {
+        MSWindow window = windows.items[i];
+        if (window.monitor == monitor && window_group(window.id) == group) {
+            windows.items[count++] = window;
+            if (window.id == handle)
+                found = true;
+        }
+    }
+    MSResult result = {0};
+    bool moved = found && ms_move(&g_state, monitor, destination, windows.items, count, &OPERATIONS, &result);
+    free(windows.items);
+    if (!moved)
+        swprintf(message, capacity, L"The app closed or changed displays. Press F5 to refresh.");
+    else if (result.errors)
+        swprintf(message, capacity, L"Move incomplete (%zu errors). Ctrl+Alt+0 can restore managed windows.", result.errors);
+    else
+        swprintf(message, capacity, L"App moved to workspace %u.", destination);
+    g_busy = false;
+    update_panel();
+    return moved && !result.errors;
+}
+
+static void carousel_activate(MSHandle monitor, unsigned workspace)
+{
+    if (g_busy)
+        return;
+    g_busy = true;
+    if (sync_displays())
+        switch_on_monitor((HMONITOR)monitor, workspace, 0);
+    update_panel();
+    g_busy = false;
+}
+
+static unsigned carousel_add(MSHandle monitor, wchar_t *message, size_t capacity)
+{
+    if (g_busy)
+        return 0;
+    g_busy = true;
+    if (!sync_displays() || !ms_carousel_visible()) {
+        g_busy = false;
+        return 0;
+    }
+    unsigned count = ms_add_workspace(&g_state, monitor);
+    if (!count)
+        swprintf(message, capacity, L"This monitor supports up to %u workspaces.", MS_MAX_WORKSPACES);
+    else if (!save_workspace_count(monitor, count))
+        swprintf(message, capacity, L"Workspace %u added for this run; the count could not be saved.", count);
+    else
+        swprintf(message, capacity, L"Workspace %u added. Your current workspace has not changed.", count);
+    update_panel();
+    g_busy = false;
+    return count;
+}
+
+static void carousel_focus(MSHandle monitor, MSHandle handle, DWORD process)
+{
+    if (g_busy)
+        return;
+    g_busy = true;
+    DWORD current_process = 0;
+    HWND window = (HWND)handle;
+    if (sync_displays() && IsWindow(window) &&
+        GetWindowThreadProcessId(window, &current_process) && current_process == process &&
+        (MSHandle)MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) == monitor) {
+        unsigned workspace = window_tag(window);
+        if (!workspace)
+            workspace = ms_active(&g_state, monitor);
+        switch_on_monitor((HMONITOR)monitor, workspace, 0);
+        ms_transition_cancel(); /* Open the selected app immediately, without a frozen preview. */
+        /* Selecting a minimized preview explicitly opens it, including windows
+         * the user had minimized before entering the workspace utility. */
+        if (IsIconic(window))
+            ms_show_without_animation(window, SW_RESTORE);
+        ms_fullscreen_apply(window);
+        HWND popup = GetLastActivePopup(window);
+        if (popup && IsWindowVisible(popup)) {
+            window = popup;
+            if (IsIconic(window))
+                ms_show_without_animation(window, SW_RESTORE);
+        }
+        SetForegroundWindow(window);
+    }
+    update_panel();
+    g_busy = false;
+}
+
+static void toggle_carousel(void)
+{
+    if (ms_carousel_visible()) {
+        ms_carousel_close();
+        return;
+    }
+    if (!sync_displays())
+        return;
+    ms_transition_cancel();
+    POINT cursor;
+    if (!GetCursorPos(&cursor))
+        return;
+    MSHandle monitor = (MSHandle)MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    const MSCarouselActions actions = {carousel_load, carousel_move, carousel_activate, carousel_add, carousel_focus};
+    if (!ms_carousel_open(GetModuleHandleW(NULL), monitor, &actions)) {
+        wcscpy(g_message, L"Could not open the workspace overview.");
+        MessageBoxW(g_panel, g_message, L"Monitor Spaces", MB_OK | MB_ICONERROR);
+    }
 }
 
 static void follow_foreground(void)
@@ -693,6 +934,7 @@ static void follow_foreground(void)
         return;
     HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
     if (ms_active(&g_state, (MSHandle)monitor) != workspace) {
+        ms_carousel_close();
         switch_on_monitor(monitor, workspace, 0);
         update_panel();
     }
@@ -782,22 +1024,45 @@ static LRESULT CALLBACK panel_proc(HWND window, UINT message, WPARAM wparam, LPA
             return 0;
         }
         g_busy = true;
-        if (message == WM_RECOVER || (message == WM_COMMAND && LOWORD(wparam) == ID_RESTORE) ||
+        if (message == WM_COMMAND && LOWORD(wparam) == ID_FULLSCREEN) {
+            ms_carousel_close();
+            ms_transition_cancel();
+            if (ms_fullscreen_enabled()) {
+                size_t errors = ms_fullscreen_restore();
+                ms_fullscreen_save_preference(false);
+                if (errors) {
+                    g_recovery_needed = true;
+                    swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
+                        L"Full-screen restore incomplete (%zu errors). Ctrl+Alt+0 retries recovery.", errors);
+                } else {
+                    wcscpy(g_message, L"Full-screen mode off. Original app layouts and taskbar setting restored.");
+                }
+            } else if (!g_recovery_needed && ms_fullscreen_enable()) {
+                ms_fullscreen_save_preference(true);
+                wcscpy(g_message, L"Full-screen mode on. Move to the taskbar's screen edge to reveal it.");
+            } else {
+                g_recovery_needed = ms_fullscreen_restore() != 0 || g_recovery_needed;
+                wcscpy(g_message, L"Could not enable full-screen mode. Retry Ctrl+Alt+0, then use the tray toggle.");
+            }
+        } else if (message == WM_RECOVER || (message == WM_COMMAND && LOWORD(wparam) == ID_RESTORE) ||
             (message == WM_HOTKEY && wparam == 0))
             recover_windows();
-        else if (message == WM_HOTKEY && wparam >= 1 && wparam <= MS_WORKSPACE_COUNT)
+        else if (message == WM_HOTKEY && wparam >= 1 && wparam <= DIRECT_WORKSPACES)
             switch_at_pointer((unsigned)wparam, 0);
         else if (message == WM_NAVIGATE && (wparam == VK_LEFT || wparam == VK_RIGHT))
             switch_at_pointer(0, wparam == VK_LEFT ? -1 : 1);
+        else if (message == WM_NAVIGATE && wparam == VK_UP)
+            toggle_carousel();
         update_panel();
         g_busy = false;
         return 0;
     case WM_NAVIGATION_ERROR:
         swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
-            L"Could not intercept Win+Arrow (Windows error %lu). Use Ctrl+Alt+1-4.", (DWORD)wparam);
+            L"Could not intercept Win+Arrow (Windows error %lu). Use Ctrl+Alt+1-4 for workspace switching.", (DWORD)wparam);
         update_panel();
         return 0;
     case WM_DISPLAYCHANGE:
+        ms_carousel_close();
         ms_transition_cancel();
         g_topology_dirty = true;
         return 0;
@@ -805,6 +1070,8 @@ static LRESULT CALLBACK panel_proc(HWND window, UINT message, WPARAM wparam, LPA
         if (wparam == TIMER_INDICATOR && !g_busy) {
             g_busy = true;
             follow_foreground();
+            if (!ms_carousel_visible())
+                ms_fullscreen_apply(GetForegroundWindow());
             update_tray();
             g_busy = false;
             return 0;
@@ -812,6 +1079,8 @@ static LRESULT CALLBACK panel_proc(HWND window, UINT message, WPARAM wparam, LPA
         if (wparam == TIMER_TOPOLOGY && !g_busy) {
             g_busy = true;
             sync_displays();
+            if (!ms_carousel_visible())
+                ms_fullscreen_update();
             update_panel();
             g_busy = false;
         }
@@ -867,7 +1136,7 @@ static LRESULT CALLBACK panel_proc(HWND window, UINT message, WPARAM wparam, LPA
         KillTimer(window, TIMER_INDICATOR);
         remove_tray();
         stop_keyboard();
-        for (unsigned i = 0; i <= MS_WORKSPACE_COUNT; ++i)
+        for (unsigned i = 0; i <= DIRECT_WORKSPACES; ++i)
             if (g_registered & (1u << i))
                 UnregisterHotKey(window, (int)i);
         recover_windows();
@@ -899,7 +1168,7 @@ static bool create_panel(HINSTANCE instance)
     if (!g_dpi)
         g_dpi = 96;
     g_intro = CreateWindowExW(0, L"STATIC",
-        L"Point at a display; use Win+Left/Right to cycle workspaces.\r\n"
+        L"Point at a display; Win+Left/Right switches, Win+Up organizes apps.\r\n"
         L"Ctrl+Alt+1-4 jumps directly to a workspace.\r\n"
         L"Ctrl+Alt+0 restores all managed windows on every display.\r\n"
         L"Close to keep running in the tray. Use Restore and exit to quit.",
@@ -1008,7 +1277,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
         CloseHandle(mutex);
         return 1;
     }
-    for (unsigned i = 0; i <= MS_WORKSPACE_COUNT; ++i) {
+    for (unsigned i = 0; i <= DIRECT_WORKSPACES; ++i) {
         if (!RegisterHotKey(g_panel, (int)i, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, '0' + i)) {
             DWORD error = GetLastError();
             wchar_t message[256];
@@ -1027,7 +1296,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
         DWORD error = GetLastError();
         wchar_t message[256];
         swprintf(message, sizeof(message) / sizeof(message[0]),
-            L"Could not enable Win+Left/Right (Windows error %lu). Monitor Spaces will exit.", error);
+            L"Could not enable Win+Left/Right/Up (Windows error %lu). Monitor Spaces will exit.", error);
         MessageBoxW(g_panel, message, L"Monitor Spaces keyboard shortcut unavailable", MB_OK | MB_ICONERROR);
         DestroyWindow(g_panel);
         DeleteObject(g_font);
@@ -1044,6 +1313,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
         return 1;
     }
     g_tray_enabled = true;
+    ms_fullscreen_configure(eligible);
+    if (!g_recovery_needed && ms_fullscreen_preferred()) {
+        g_busy = true;
+        if (ms_fullscreen_enable()) {
+            wcscpy(g_message, L"Full-screen apps enabled. Move to the taskbar's edge to reveal it; the tray menu toggles this mode.");
+        } else {
+            g_recovery_needed = ms_fullscreen_restore() != 0;
+            wcscpy(g_message, L"Full-screen mode could not start. Use Ctrl+Alt+0 to retry recovery, then enable it from the tray menu.");
+        }
+        g_busy = false;
+    }
     bool tray_ok = update_tray();
     if (!tray_ok)
         wcscpy(g_message, L"The notification icon is unavailable. The panel stays open; the icon will be retried.");

@@ -5,7 +5,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MS_WORKSPACE_COUNT 4u
+#define MS_DEFAULT_WORKSPACES 4u
+#define MS_MAX_WORKSPACES 99u
 #define MS_MAX_MONITORS 64u
 
 typedef uintptr_t MSHandle;
@@ -13,6 +14,7 @@ typedef uintptr_t MSHandle;
 typedef struct {
     MSHandle id;
     unsigned active;
+    unsigned workspaces;
 } MSMonitor;
 
 typedef struct {
@@ -49,11 +51,18 @@ typedef struct {
 bool ms_valid_tag(unsigned tag);
 bool ms_set_monitors(MSState *state, const MSHandle *ids, size_t count);
 unsigned ms_active(const MSState *state, MSHandle monitor);
+unsigned ms_workspace_count(const MSState *state, MSHandle monitor);
+bool ms_set_workspace_count(MSState *state, MSHandle monitor, unsigned count);
+unsigned ms_add_workspace(MSState *state, MSHandle monitor);
 unsigned ms_adjacent(const MSState *state, MSHandle monitor, int direction);
 bool ms_switch(MSState *state, MSHandle monitor, unsigned destination,
                MSWindow *windows, size_t count, const MSOperations *ops,
                MSResult *result);
 void ms_restore(MSState *state, MSWindow *windows, size_t count,
                 const MSOperations *ops, MSResult *result);
+/* Move a supplied window group without switching the monitor's active workspace.
+ * All members are tagged before any owner can implicitly minimize its popups. */
+bool ms_move(const MSState *state, MSHandle monitor, unsigned destination,
+             MSWindow *windows, size_t count, const MSOperations *ops, MSResult *result);
 
 #endif
