@@ -9,7 +9,7 @@ typedef struct {
     DWORD process;
     unsigned workspace;
     wchar_t title[256];
-    HICON icon; /* Owned by the carousel, not by the snapshot provider. */
+    HICON icon; /* Large preview icon; owned by the carousel, not the snapshot provider. */
 } MSCarouselItem;
 
 typedef struct {

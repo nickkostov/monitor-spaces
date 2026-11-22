@@ -21,6 +21,7 @@
 #include "slide.h"
 #include "transition_win32.h"
 #include "carousel_win32.h"
+#include "fullscreen_win32.h"
 
 /* Store an integer, never a pointer into this process. The property stays on
  * the foreign HWND if this utility is killed. Keep this key stable in updates. */
@@ -32,7 +33,7 @@ static const wchar_t PANEL_CLASS[] = L"MonitorSpaces.Panel.v1";
 static const wchar_t MUTEX_NAME[] = L"Local\\MonitorSpaces.Instance.v1";
 static const wchar_t COUNTS_KEY[] = L"Software\\MonitorSpaces\\WorkspaceCounts";
 
-enum { ID_RESTORE = 100, ID_EXIT, ID_SHOW_PANEL,
+enum { ID_RESTORE = 100, ID_EXIT, ID_SHOW_PANEL, ID_FULLSCREEN,
        TIMER_TOPOLOGY = 1, TIMER_INDICATOR, TRAY_ID = 1,
        WM_RECOVER = WM_APP + 1, WM_NAVIGATE, WM_NAVIGATION_ERROR,
        WM_TRAY, WM_SHOW_PANEL, WM_EXIT, DIRECT_WORKSPACES = 4 };
@@ -216,6 +217,8 @@ static void tray_menu(POINT point)
     if (!menu)
         return;
     AppendMenuW(menu, MF_STRING, ID_SHOW_PANEL, L"&Open panel");
+    AppendMenuW(menu, MF_STRING | (ms_fullscreen_enabled() ? MF_CHECKED : MF_UNCHECKED),
+                ID_FULLSCREEN, L"&Full-screen apps and auto-hide taskbar");
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, ID_RESTORE, L"&Restore all windows");
     AppendMenuW(menu, MF_STRING, ID_EXIT, L"Restore and e&xit");
@@ -431,8 +434,9 @@ static bool set_tag(void *context, MSHandle handle, unsigned workspace)
     if (!IsWindow(window) || (!tagged && !eligible(window)))
         return false;
     if (!tagged) {
-        unsigned state = IsIconic(window) ? SW_SHOWMINIMIZED :
-                         IsZoomed(window) ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+        unsigned state = ms_fullscreen_original_state(window);
+        if (IsIconic(window)) state = SW_SHOWMINIMIZED;
+        else if (!state) state = IsZoomed(window) ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
         if (!SetPropW(window, STATE_KEY, (HANDLE)(ULONG_PTR)state))
             return false;
     }
@@ -496,6 +500,7 @@ static bool show_window(void *context, MSHandle handle)
     } else if (IsIconic(window) || !IsWindowVisible(window)) {
         ms_show_without_animation(window, state == SW_SHOWMAXIMIZED ? SW_SHOWMAXIMIZED : SW_SHOWNOACTIVATE);
     }
+    ms_fullscreen_apply(window);
     return !IsWindow(window) || (IsWindowVisible(window) &&
         (state == SW_SHOWMINIMIZED || !IsIconic(window)));
 }
@@ -546,7 +551,7 @@ static bool same_displays(const Displays *left, const Displays *right)
         const Display *a = &left->items[i], *b = &right->items[i];
         if (a->handle != b->handle || wcscmp(a->info.szDevice, b->info.szDevice) ||
             !EqualRect(&a->info.rcMonitor, &b->info.rcMonitor) ||
-            !EqualRect(&a->info.rcWork, &b->info.rcWork) || a->info.dwFlags != b->info.dwFlags)
+            a->info.dwFlags != b->info.dwFlags)
             return false;
     }
     return true;
@@ -586,6 +591,7 @@ static void update_panel(void)
 
 static MSResult recover_windows(void)
 {
+    ms_fullscreen_suspend();
     ms_carousel_close();
     ms_transition_cancel();
     Windows windows;
@@ -596,6 +602,7 @@ static MSResult recover_windows(void)
         ms_restore(&g_state, windows.items, windows.count, &OPERATIONS, &result);
         free(windows.items);
     }
+    result.errors += ms_fullscreen_restore();
     g_recovery_needed = result.errors != 0;
     if (result.errors)
         swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
@@ -603,7 +610,7 @@ static MSResult recover_windows(void)
             L"use the same privilege level as the previous run.", result.errors);
     else
         swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
-            L"Restored %zu tagged windows. All displays are on workspace 1.", result.shown);
+            L"Restored %zu workspace windows, original app layouts, and taskbar settings. All displays are on workspace 1.", result.shown);
     return result;
 }
 
@@ -673,6 +680,10 @@ static bool sync_displays(void)
         g_topology_dirty = false;
         if (!result.errors)
             wcscpy(g_message, L"Display configuration updated. Windows restored; all workspaces reset to 1.");
+    } else {
+        /* Auto-hide changes rcWork without changing monitors. Keep live work
+         * areas, but do not undo full-screen mode or reset workspace membership. */
+        g_displays = displays;
     }
     return !g_recovery_needed;
 }
@@ -685,6 +696,7 @@ static void switch_on_monitor(HMONITOR target, unsigned workspace, int navigatio
         return;
     }
     Windows windows;
+    ms_fullscreen_update();
     if (!snapshot_windows(&windows)) {
         wcscpy(g_message, L"Could not enumerate windows. No windows changed.");
         return;
@@ -873,6 +885,7 @@ static void carousel_focus(MSHandle monitor, MSHandle handle, DWORD process)
          * the user had minimized before entering the workspace utility. */
         if (IsIconic(window))
             ms_show_without_animation(window, SW_RESTORE);
+        ms_fullscreen_apply(window);
         HWND popup = GetLastActivePopup(window);
         if (popup && IsWindowVisible(popup)) {
             window = popup;
@@ -1011,7 +1024,27 @@ static LRESULT CALLBACK panel_proc(HWND window, UINT message, WPARAM wparam, LPA
             return 0;
         }
         g_busy = true;
-        if (message == WM_RECOVER || (message == WM_COMMAND && LOWORD(wparam) == ID_RESTORE) ||
+        if (message == WM_COMMAND && LOWORD(wparam) == ID_FULLSCREEN) {
+            ms_carousel_close();
+            ms_transition_cancel();
+            if (ms_fullscreen_enabled()) {
+                size_t errors = ms_fullscreen_restore();
+                ms_fullscreen_save_preference(false);
+                if (errors) {
+                    g_recovery_needed = true;
+                    swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
+                        L"Full-screen restore incomplete (%zu errors). Ctrl+Alt+0 retries recovery.", errors);
+                } else {
+                    wcscpy(g_message, L"Full-screen mode off. Original app layouts and taskbar setting restored.");
+                }
+            } else if (!g_recovery_needed && ms_fullscreen_enable()) {
+                ms_fullscreen_save_preference(true);
+                wcscpy(g_message, L"Full-screen mode on. Move to the taskbar's screen edge to reveal it.");
+            } else {
+                g_recovery_needed = ms_fullscreen_restore() != 0 || g_recovery_needed;
+                wcscpy(g_message, L"Could not enable full-screen mode. Retry Ctrl+Alt+0, then use the tray toggle.");
+            }
+        } else if (message == WM_RECOVER || (message == WM_COMMAND && LOWORD(wparam) == ID_RESTORE) ||
             (message == WM_HOTKEY && wparam == 0))
             recover_windows();
         else if (message == WM_HOTKEY && wparam >= 1 && wparam <= DIRECT_WORKSPACES)
@@ -1037,6 +1070,8 @@ static LRESULT CALLBACK panel_proc(HWND window, UINT message, WPARAM wparam, LPA
         if (wparam == TIMER_INDICATOR && !g_busy) {
             g_busy = true;
             follow_foreground();
+            if (!ms_carousel_visible())
+                ms_fullscreen_apply(GetForegroundWindow());
             update_tray();
             g_busy = false;
             return 0;
@@ -1044,6 +1079,8 @@ static LRESULT CALLBACK panel_proc(HWND window, UINT message, WPARAM wparam, LPA
         if (wparam == TIMER_TOPOLOGY && !g_busy) {
             g_busy = true;
             sync_displays();
+            if (!ms_carousel_visible())
+                ms_fullscreen_update();
             update_panel();
             g_busy = false;
         }
@@ -1276,6 +1313,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, 
         return 1;
     }
     g_tray_enabled = true;
+    ms_fullscreen_configure(eligible);
+    if (!g_recovery_needed && ms_fullscreen_preferred()) {
+        g_busy = true;
+        if (ms_fullscreen_enable()) {
+            wcscpy(g_message, L"Full-screen apps enabled. Move to the taskbar's edge to reveal it; the tray menu toggles this mode.");
+        } else {
+            g_recovery_needed = ms_fullscreen_restore() != 0;
+            wcscpy(g_message, L"Full-screen mode could not start. Use Ctrl+Alt+0 to retry recovery, then enable it from the tray menu.");
+        }
+        g_busy = false;
+    }
     bool tray_ok = update_tray();
     if (!tray_ok)
         wcscpy(g_message, L"The notification icon is unavailable. The panel stays open; the icon will be retried.");

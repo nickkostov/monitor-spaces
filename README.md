@@ -10,10 +10,11 @@ monitor starts on workspace 1; added workspace counts are remembered per monitor
 | Win + Right | Next workspace on the monitor under the pointer; its last workspace wraps to 1 |
 | Win + Up | Open/close a full-screen app overview on the monitor under the pointer; drag previews to workspaces |
 | Ctrl + Alt + 1–4 | Switch the monitor under the pointer to workspace 1–4 |
-| Ctrl + Alt + 0 | Restore all managed windows; reset all monitors to workspace 1 |
+| Ctrl + Alt + 0 | Restore managed windows, original app layouts and taskbar setting; reset all monitors to workspace 1 |
 | Restore all button | Same as Ctrl + Alt + 0 |
 | Numbered tray icon | Show the workspace on the monitor under the pointer; click to open the panel |
 | Right-click tray icon | Open the panel, restore windows, or restore and exit |
+| Full-screen apps and auto-hide taskbar (tray menu) | Toggle borderless full-screen app windows and Windows taskbar auto-hide; choice is remembered |
 | Close / minimize panel | Hide the panel and keep running in the background |
 | Restore and exit | Restore managed windows, remove the tray icon, unregister shortcuts, exit |
 
@@ -23,10 +24,10 @@ Alt+Tab to switch its monitor to that app's workspace (within 250 ms), regardles
 of where the pointer is. Windows you had already minimized stay minimized when
 switching back, unless you select them yourself.
 
-Workspace changes use a 400 ms horizontal slide across the selected monitor's
-work area. Left/right shortcuts keep their direction when wrapping between 1
-and 4; direct numbered shortcuts slide toward the selected number. The taskbar
-stays stationary, and another shortcut interrupts the current slide. The utility
+Workspace changes use a 400 ms horizontal slide across the selected monitor
+(its work area when full-screen mode is off). Left/right shortcuts keep their
+direction when wrapping between 1 and 4; direct numbered shortcuts slide toward
+the selected number. Another shortcut interrupts the current slide. The utility
 suppresses native minimize/restore transitions while changing window states.
 Frames use a high-resolution clock, complete layered-window updates, and DWM
 presentation pacing. Repeated shortcuts continue from the currently displayed
@@ -53,6 +54,36 @@ arrow again for each step; holding it does not cycle repeatedly. Both Win keys
 work. Combinations with additional Ctrl, Alt, or Shift modifiers pass through,
 including Win + Ctrl + Left/Right and Win + Shift + Left/Right.
 
+## Full-screen apps and taskbar auto-hide
+
+By default, regular resizable main windows fill their monitor without the standard
+title bar or resize frame. This works during normal app use as well as workspace
+switching. New foreground windows are checked every 250 ms; other windows are
+checked every second. Dialogs, tool windows, fixed-size windows, already-borderless
+apps, minimized windows, and windows that cannot be managed keep their normal
+behavior. App controls drawn inside the client area can remain visible.
+
+The mode enables Windows' taskbar auto-hide. Move to the taskbar's screen edge
+to reveal it; moving away lets Windows hide it again. The setting applies to all
+Windows taskbars. App windows remain below the taskbar when it reveals, and the
+utility never calls Hide on Explorer's taskbar windows.
+
+Right-click the numbered tray icon and uncheck **Full-screen apps and auto-hide
+taskbar** to restore the original window frames/positions and taskbar preference
+without changing workspace assignments. Recheck it to enable the mode again.
+This choice is saved as `FullscreenEnabled` under `HKCU\Software\MonitorSpaces`.
+**Ctrl + Alt + 0**, **Restore and exit**, shutdown, and monitor configuration
+changes also restore layouts and the prior taskbar preference. Recovery leaves
+full-screen mode off for that run; the saved preference applies on the next launch.
+Changing taskbar work area alone does not reset workspaces or disable the mode.
+
+Original styles and placements are journaled as numeric properties on each window
+before changes. The original auto-hide value is saved in the current user's
+registry before enabling it. These records survive an interrupted utility run;
+the next launch recovers them before reapplying your preference. Run `--restore`
+to recover and exit without re-enabling the mode. Failed recovery records are
+retained for retry. Borderless mode and taskbar reveal require live Windows checks.
+
 ## Run
 
 Extract `dist/monitor-spaces-windows-x64.zip`, then run `MonitorSpaces.exe`
@@ -77,25 +108,48 @@ exits. **Restore and exit** removes the hook and restores normal key handling.
 
 ## Organize apps with Win + Up
 
-Point at a monitor and press **Win + Up**. A borderless, full-screen overview
-shows four workspace cards across the top and a large app-preview grid below.
+Point at a monitor and press **Win + Up**. A Mission Control-style overview
+shows floating app previews over that monitor's wallpaper, with four miniature
+desktops in a softened strip across the top. Windows keep their aspect ratios,
+with app icons and titles underneath, hover outlines, and centered partial rows.
+The thumbnails zoom into place over 400 ms with smooth easing and compositor
+pacing. Only the DWM previews move during the zoom; borders and labels appear
+when they settle, avoiding a full-screen software repaint on every frame.
+Geometry is cached and timing preserves fractional milliseconds for high-refresh
+displays. Reduced-motion settings and Remote Desktop skip the entrance animation;
+clicking or typing finishes it immediately. Dragging repaints the old/new preview
+areas and changed drop targets, rather than the entire screen for each mouse move.
+App icons use the window's large icon or a larger embedded executable icon when
+available. Separate 48/20/16-logical-pixel preview, caption, and miniature variants
+are prepared at the monitor's DPI with alpha-preserving, filtered resizing.
+Icon loading happens during opening/refresh, outside animation and drag rendering.
+Apps that only supply low-resolution artwork can still look softer at high DPI.
+The wallpaper is read from Windows, including per-monitor images, solid colors,
+and the normal fill/fit/stretch/center/tile/span positioning. JPEG, PNG, and BMP
+decoding uses Windows' built-in imaging components; no image assets or codecs
+are bundled. The wallpaper and softened backdrop are cached for each opening.
+Unavailable wallpaper falls back to the desktop color or a muted background.
 The actual active workspace is marked separately from the workspace being browsed.
-Click a workspace card to browse its apps without switching your desktop. Scroll
+The strip labels these workspaces **Desktop 1**, **Desktop 2**, and so on; a dot
+marks the active one and a blue outline marks the one being browsed.
+Click a desktop preview to browse its apps without switching your desktop. Scroll
 to reach more previews, click a preview to open that app, or double-click a
-workspace / press **Enter** to switch to the workspace being browsed. Plain
+desktop / click the wallpaper / press **Enter** to switch to the desktop being browsed. Plain
 Left/Right arrows browse workspaces inside the overview.
-Click **+ Add workspace** to create another space on that monitor, up to 99.
+Click the **+** at the right of the strip to create another space on that monitor,
+up to 99. Drag a window onto **+** to create a space and move the window there in
+one gesture; if the move fails, the new empty space remains available.
 Adding a space preserves the active workspace and all app assignments. Use
-**< / >** to browse additional cards; while dragging an app, hover over an arrow
+the strip's **‹ / ›** arrows to browse additional desktops; while dragging an app, hover over an arrow
 for half a second to page without releasing it. Win+Left/Right cycles through
 every configured space, while Ctrl+Alt+1–4 retains the original direct shortcuts.
-Drag an app preview onto a workspace card to move that app. Dropping onto an inactive
+Drag an app preview onto a miniature desktop to move that app. Dropping onto an inactive
 workspace minimizes it there; dropping onto the active workspace restores it
 according to its saved state. Moving an app does not switch your current
 workspace or change the other monitor's workspace. Owned dialogs on the same
 monitor move with their app; separate main windows can be moved independently.
 
-Press **F5** to refresh opened/closed windows. **Esc**, the top-right **X**,
+Press **F5** to refresh opened/closed windows. **Esc**, the bottom-right **×**,
 switching focus to another app, or **Win + Up** again closes the overview.
 Dropping outside the workspace cards, losing mouse capture, or closing mid-drag
 cancels the move. Restore, exit, and display changes also close the overview. The utility rechecks the app
@@ -105,12 +159,15 @@ group. Failed operations retain recovery tags for **Ctrl + Alt + 0**.
 The overview covers the selected monitor's taskbar. Move the pointer to the
 taskbar's screen edge to reveal it; move back into the overview to cover it
 again. This works by temporarily cutting a taskbar-sized strip out of the
-overview window. Taskbar visibility and auto-hide settings are never changed,
-and closing or terminating the utility removes the covering window. Other
-monitors keep their normal taskbars. Opening a taskbar app or Start can dismiss
+overview window. The overview itself leaves shell visibility/settings alone;
+the full-screen app mode described above manages the temporary auto-hide setting.
+Closing or terminating the utility removes the covering window. Other monitors
+keep their own taskbars. Opening a taskbar app or Start can dismiss
 the overview as focus changes.
 
 App previews use DWM thumbnails and preserve the source window's aspect ratio.
+Miniature desktops show the wallpaper and smaller app previews in their original
+positions, with a window outline/icon fallback when a miniature is unavailable.
 Opening/browsing the overview does not maximize, restore, or move application
 windows. Minimized apps can show their last available frame; unsupported or
 protected previews may show an app icon or blank content instead. The overview
@@ -184,7 +241,8 @@ Recovery scans all tagged top-level windows, including ones no longer eligible
 or attached to the original monitor. It runs at startup, on Ctrl + Alt + 0, on
 **Restore and exit**, and during session shutdown. Display changes also trigger
 recovery and reset all workspace numbers to 1. A one-second topology check covers
-missed notifications, monitor repositioning, and work-area changes.
+missed notifications and monitor repositioning. Taskbar work-area changes are
+updated without resetting workspace membership.
 
 After an interrupted run, launch the utility again, or run:
 

@@ -17,10 +17,21 @@
 
 #include "carousel_win32.h"
 #include "overview_layout.h"
+#include "wallpaper_win32.h"
+#include "app_icons_win32.h"
 
 static const wchar_t CAROUSEL_CLASS[] = L"MonitorSpaces.Carousel.v1";
 enum { VISIBLE_CARDS = 4, TIMER_DRAG_PAGE = 1, TIMER_TASKBAR };
-typedef struct { HTHUMBNAIL handle; SIZE size; } Preview;
+enum { WM_OVERVIEW_FRAME = WM_APP + 120 };
+typedef struct {
+    HTHUMBNAIL handle, miniature;
+    HICON caption_icon, miniature_icon;
+    SIZE size;
+    RECT original;
+    RECT tile, target, start, mini_target;
+    DWM_THUMBNAIL_PROPERTIES last, mini_last;
+    bool minimized, last_valid, mini_valid, visible;
+} Preview;
 typedef struct {
     HWND window, taskbar;
     MSHandle monitor;
@@ -28,20 +39,30 @@ typedef struct {
     MSCarouselActions actions;
     MSCarouselItem *items;
     Preview *previews;
-    size_t count, pressed;
-    unsigned active, view, spaces, first, dpi, drop, taskbar_edge;
+    size_t count, pressed, hovered;
+    unsigned active, view, spaces, first, dpi, drop, taskbar_edge, hover_space;
     int scroll[MS_MAX_WORKSPACES], hover_page, taskbar_size;
     HFONT font, heading;
     HDC buffer;
     HBITMAP bitmap;
     HGDIOBJ old_bitmap;
     SIZE buffer_size;
+    HDC wallpaper_dc, backdrop_dc;
+    HBITMAP wallpaper, backdrop;
+    HGDIOBJ wallpaper_old, backdrop_old;
     POINT origin, pointer;
-    bool dragging, busy, closing, taskbar_revealed;
+    bool dragging, busy, closing, taskbar_revealed, hover_add;
     ULONGLONG taskbar_leave;
+    LARGE_INTEGER started, frequency;
+    unsigned generation;
+    double progress;
+    bool layout_valid;
+    unsigned layout_view, layout_first;
+    int layout_scroll;
     wchar_t message[256];
 } Carousel;
 static Carousel g_carousel;
+static unsigned g_generation;
 
 static int scaled(int value) { return MulDiv(value, (int)g_carousel.dpi, 96); }
 static MSOverviewRect portable(RECT r) { return (MSOverviewRect){r.left, r.top, r.right, r.bottom}; }
@@ -52,14 +73,36 @@ static bool over_taskbar(POINT point)
     return g_carousel.taskbar_revealed && PtInRect(&g_carousel.revealed_strip, point);
 }
 
+static int strip_height(void)
+{
+    RECT client;
+    GetClientRect(g_carousel.window, &client);
+    int height = scaled(148);
+    return height < client.bottom / 3 ? height : client.bottom / 3;
+}
+
 static RECT card_rect(unsigned workspace)
 {
     RECT client;
     GetClientRect(g_carousel.window, &client);
-    int margin = scaled(40), gap = scaled(16);
-    int width = (client.right - 2 * margin - (VISIBLE_CARDS - 1) * gap) / VISIBLE_CARDS;
-    int left = margin + (int)(workspace - g_carousel.first - 1) * (width + gap);
-    return (RECT){left, scaled(88), left + width, scaled(202)};
+    int gap = scaled(24), width = scaled(172);
+    int available = (client.right - scaled(224) - (VISIBLE_CARDS - 1) * gap) / VISIBLE_CARDS;
+    if (width > available) width = available;
+    if (width < 1) width = 1;
+    MSOverviewRect fitted = ms_overview_fit((MSOverviewRect){0, 0, width, strip_height() - scaled(42)},
+        g_carousel.bounds.right - g_carousel.bounds.left, g_carousel.bounds.bottom - g_carousel.bounds.top);
+    int height = fitted.bottom - fitted.top;
+    int left = (client.right - (VISIBLE_CARDS * width + (VISIBLE_CARDS - 1) * gap)) / 2 +
+               (int)(workspace - g_carousel.first - 1) * (width + gap);
+    int top = (strip_height() - height - scaled(24)) / 2;
+    return (RECT){left, top, left + width, top + height + scaled(24)};
+}
+
+static RECT card_body(unsigned workspace)
+{
+    RECT rect = card_rect(workspace);
+    rect.bottom -= scaled(24);
+    return rect;
 }
 
 static unsigned card_at(POINT point)
@@ -88,25 +131,88 @@ static MSOverviewGrid grid(void)
 {
     RECT client;
     GetClientRect(g_carousel.window, &client);
-    MSOverviewRect area = {scaled(40), scaled(270), client.right - scaled(40), client.bottom - scaled(68)};
+    MSOverviewRect area = {scaled(48), strip_height() + scaled(32),
+        client.right - scaled(48), client.bottom - scaled(64)};
     return ms_overview_grid(area, (size_t)workspace_count(g_carousel.view),
         g_carousel.scroll[g_carousel.view - 1], MulDiv((int)g_carousel.dpi, 100, 96));
 }
 
+static RECT preview_area(size_t index, RECT tile)
+{
+    tile.bottom -= scaled(42);
+    SIZE size = g_carousel.previews[index].size;
+    if (size.cx <= 0 || size.cy <= 0) {
+        size.cx = 16;
+        size.cy = 10;
+    }
+    return native(ms_overview_fit(portable(tile), size.cx, size.cy));
+}
+
+static void update_layout(void)
+{
+    if (g_carousel.layout_valid && g_carousel.layout_view == g_carousel.view &&
+        g_carousel.layout_first == g_carousel.first &&
+        g_carousel.layout_scroll == g_carousel.scroll[g_carousel.view - 1])
+        return;
+    MSOverviewGrid layout = grid();
+    RECT client;
+    GetClientRect(g_carousel.window, &client);
+    size_t ordinal = 0;
+    for (size_t i = 0; i < g_carousel.count; ++i) {
+        Preview *preview = &g_carousel.previews[i];
+        MSOverviewRect cell = {0};
+        preview->visible = false;
+        if (g_carousel.items[i].workspace == g_carousel.view)
+            preview->visible = ms_overview_cell(&layout, ordinal++, &cell);
+        preview->tile = native(cell);
+        preview->target = preview_area(i, preview->tile);
+        preview->start = preview->original;
+        OffsetRect(&preview->start, -g_carousel.bounds.left, -g_carousel.bounds.top);
+        if (preview->minimized || !IntersectRect(&preview->start, &preview->start, &client)) {
+            preview->start = preview->target;
+            InflateRect(&preview->start, -(preview->start.right - preview->start.left) / 10,
+                        -(preview->start.bottom - preview->start.top) / 10);
+        }
+        unsigned workspace = g_carousel.items[i].workspace;
+        preview->mini_target = (RECT){0};
+        if (workspace > g_carousel.first && workspace <= g_carousel.first + VISIBLE_CARDS) {
+            RECT card = card_body(workspace);
+            InflateRect(&card, -scaled(2), -scaled(2));
+            preview->mini_target = native(ms_overview_project(portable(card), portable(g_carousel.bounds),
+                                                             portable(preview->original)));
+        }
+    }
+    g_carousel.layout_view = g_carousel.view;
+    g_carousel.layout_first = g_carousel.first;
+    g_carousel.layout_scroll = g_carousel.scroll[g_carousel.view - 1];
+    g_carousel.layout_valid = true;
+}
+
 static bool tile_rect(size_t index, RECT *rect)
 {
-    if (g_carousel.items[index].workspace != g_carousel.view)
-        return false;
-    size_t ordinal = 0;
-    for (size_t i = 0; i < index; ++i)
-        if (g_carousel.items[i].workspace == g_carousel.view)
-            ++ordinal;
-    MSOverviewGrid layout = grid();
-    MSOverviewRect cell;
-    if (!ms_overview_cell(&layout, ordinal, &cell))
-        return false;
-    *rect = native(cell);
-    return true;
+    update_layout();
+    *rect = g_carousel.previews[index].tile;
+    return g_carousel.previews[index].visible;
+}
+
+static RECT preview_destination(size_t index, RECT tile)
+{
+    if (g_carousel.dragging && g_carousel.pressed == index)
+        return preview_area(index, tile);
+    update_layout();
+    Preview *preview = &g_carousel.previews[index];
+    /* Icon fallbacks stay still; only DWM surfaces move during the entrance. */
+    if (g_carousel.progress >= 1.0 || !preview->handle)
+        return preview->target;
+    return native(ms_overview_interpolate(portable(preview->start), portable(preview->target), g_carousel.progress));
+}
+
+static void finish_entrance(void)
+{
+    if (g_carousel.progress < 1.0) {
+        g_carousel.progress = 1.0;
+        InvalidateRect(g_carousel.window, NULL, FALSE);
+    }
 }
 
 static size_t tile_at(POINT point)
@@ -115,8 +221,12 @@ static size_t tile_at(POINT point)
         return SIZE_MAX;
     for (size_t i = 0; i < g_carousel.count; ++i) {
         RECT rect;
-        if (tile_rect(i, &rect) && PtInRect(&rect, point))
-            return i;
+        if (tile_rect(i, &rect)) {
+            rect = preview_destination(i, rect);
+            rect.bottom += scaled(36);
+            if (PtInRect(&rect, point))
+                return i;
+        }
     }
     return SIZE_MAX;
 }
@@ -138,10 +248,23 @@ static RECT ghost_rect(void)
     return (RECT){left, top, left + width, top + height};
 }
 
-static RECT preview_area(RECT tile)
+static RECT miniature_rect(size_t index)
 {
-    return (RECT){tile.left + scaled(8), tile.top + scaled(40),
-                  tile.right - scaled(8), tile.bottom - scaled(8)};
+    update_layout();
+    return g_carousel.previews[index].mini_target;
+}
+
+static void update_preview(HTHUMBNAIL handle, const DWM_THUMBNAIL_PROPERTIES *properties,
+                           DWM_THUMBNAIL_PROPERTIES *last, bool *valid)
+{
+    if (!handle || (*valid && last->fVisible == properties->fVisible &&
+        (!properties->fVisible || (EqualRect(&last->rcDestination, &properties->rcDestination) &&
+                                   last->opacity == properties->opacity))))
+        return;
+    if (SUCCEEDED(DwmUpdateThumbnailProperties(handle, properties))) {
+        *last = *properties;
+        *valid = true;
+    }
 }
 
 static void sync_previews(void)
@@ -149,8 +272,6 @@ static void sync_previews(void)
     RECT ghost = ghost_rect();
     for (size_t i = 0; i < g_carousel.count; ++i) {
         Preview *preview = &g_carousel.previews[i];
-        if (!preview->handle)
-            continue;
         RECT tile = {0}, intersection;
         bool dragged = g_carousel.dragging && g_carousel.pressed == i;
         bool visible = dragged || tile_rect(i, &tile);
@@ -158,14 +279,20 @@ static void sync_previews(void)
             tile = ghost;
         else if (visible && g_carousel.dragging && IntersectRect(&intersection, &tile, &ghost))
             visible = false; /* Keep other DWM thumbnails below the drag ghost. */
-        RECT fitted = native(ms_overview_fit(portable(preview_area(tile)), preview->size.cx, preview->size.cy));
+        RECT fitted = preview_destination(i, tile);
         DWM_THUMBNAIL_PROPERTIES properties = {
             .dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | DWM_TNP_SOURCECLIENTAREAONLY,
             .rcDestination = fitted, .opacity = dragged ? 235 : 255,
             .fVisible = visible && fitted.right > fitted.left && fitted.bottom > fitted.top,
             .fSourceClientAreaOnly = FALSE
         };
-        DwmUpdateThumbnailProperties(preview->handle, &properties);
+        update_preview(preview->handle, &properties, &preview->last, &preview->last_valid);
+        RECT miniature = miniature_rect(i);
+        properties.rcDestination = miniature;
+        properties.opacity = 255;
+        properties.fVisible = miniature.right > miniature.left && miniature.bottom > miniature.top &&
+            !(g_carousel.dragging && IntersectRect(&intersection, &miniature, &ghost));
+        update_preview(preview->miniature, &properties, &preview->mini_last, &preview->mini_valid);
     }
 }
 
@@ -176,6 +303,12 @@ static void free_snapshot(MSCarouselItem *items, Preview *previews, size_t count
             DestroyIcon(items[i].icon);
         if (previews && previews[i].handle)
             DwmUnregisterThumbnail(previews[i].handle);
+        if (previews && previews[i].miniature)
+            DwmUnregisterThumbnail(previews[i].miniature);
+        if (previews && previews[i].caption_icon)
+            DestroyIcon(previews[i].caption_icon);
+        if (previews && previews[i].miniature_icon)
+            DestroyIcon(previews[i].miniature_icon);
     }
     free(previews);
     free(items);
@@ -202,21 +335,39 @@ static bool refresh(void)
             g_carousel.busy = previous_busy;
         return false;
     }
+    MSIconLoader loader;
+    ms_icon_loader_open(&loader);
+    if (window != g_carousel.window) {
+        ms_icon_loader_close(&loader);
+        free_snapshot(items, previews, count);
+        return false;
+    }
     ULONGLONG deadline = GetTickCount64() + 120;
+    unsigned dpi = g_carousel.dpi;
     for (size_t i = 0; i < count; ++i) {
-        DWORD_PTR icon = 0;
-        if (GetTickCount64() < deadline)
-            SendMessageTimeoutW((HWND)items[i].window, WM_GETICON, ICON_SMALL2, g_carousel.dpi,
-                                SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT, 30, &icon);
+        MSAppIcons icons = ms_app_icons_load(&loader, (HWND)items[i].window, items[i].process, dpi, deadline);
+        items[i].icon = icons.large;
+        previews[i].caption_icon = icons.caption;
+        previews[i].miniature_icon = icons.miniature;
         if (window != g_carousel.window) {
+            ms_icon_loader_close(&loader);
             free_snapshot(items, previews, count);
             return false;
         }
-        if (!icon)
-            icon = (DWORD_PTR)GetClassLongPtrW((HWND)items[i].window, GCLP_HICONSM);
-        if (!icon)
-            icon = (DWORD_PTR)LoadIconW(NULL, IDI_APPLICATION);
-        items[i].icon = CopyIcon((HICON)icon);
+        HWND source = (HWND)items[i].window;
+        previews[i].minimized = IsIconic(source) != FALSE;
+        GetWindowRect(source, &previews[i].original);
+        if (previews[i].minimized) {
+            WINDOWPLACEMENT placement = {.length = sizeof(placement)};
+            MONITORINFO info = {.cbSize = sizeof(info)};
+            if (GetWindowPlacement(source, &placement) && GetMonitorInfoW((HMONITOR)g_carousel.monitor, &info)) {
+                previews[i].original = placement.rcNormalPosition;
+                OffsetRect(&previews[i].original, info.rcWork.left - info.rcMonitor.left,
+                           info.rcWork.top - info.rcMonitor.top);
+                if (placement.flags & WPF_RESTORETOMAXIMIZED)
+                    previews[i].original = info.rcWork;
+            }
+        }
         /* Thumbnails never restore, resize, or move source application windows. */
         if (SUCCEEDED(DwmRegisterThumbnail(window, (HWND)items[i].window, &previews[i].handle))) {
             if (FAILED(DwmQueryThumbnailSourceSize(previews[i].handle, &previews[i].size)) ||
@@ -225,11 +376,21 @@ static bool refresh(void)
                 previews[i].handle = NULL;
             }
         }
+        DwmRegisterThumbnail(window, source, &previews[i].miniature);
+        if (previews[i].miniature == previews[i].handle)
+            previews[i].miniature = NULL;
+    }
+    ms_icon_loader_close(&loader);
+    if (window != g_carousel.window) {
+        free_snapshot(items, previews, count);
+        return false;
     }
     free_snapshot(g_carousel.items, g_carousel.previews, g_carousel.count);
     g_carousel.items = items;
     g_carousel.previews = previews;
     g_carousel.count = count;
+    g_carousel.layout_valid = false;
+    g_carousel.hovered = SIZE_MAX;
     g_carousel.active = active;
     g_carousel.spaces = spaces;
     if (!g_carousel.view || g_carousel.view > spaces)
@@ -246,11 +407,8 @@ static bool refresh(void)
 
 static void fill(HDC dc, const RECT *rect, COLORREF color)
 {
-    HBRUSH brush = CreateSolidBrush(color);
-    if (brush) {
-        FillRect(dc, rect, brush);
-        DeleteObject(brush);
-    }
+    SetDCBrushColor(dc, color);
+    FillRect(dc, rect, GetStockObject(DC_BRUSH));
 }
 
 static void label(HDC dc, const wchar_t *text, RECT rect, COLORREF color, UINT flags)
@@ -263,16 +421,15 @@ static RECT control_rect(int control)
 {
     RECT client;
     GetClientRect(g_carousel.window, &client);
-    int right = client.right - scaled(32);
     if (control == 2)
-        return (RECT){right - scaled(32), scaled(20), right, scaled(52)};
-    right -= scaled(44);
+        return (RECT){client.right - scaled(52), client.bottom - scaled(48),
+                      client.right - scaled(20), client.bottom - scaled(16)};
+    int top = (strip_height() - scaled(36)) / 2;
     if (control == 0)
-        return (RECT){right - scaled(160), scaled(20), right, scaled(52)};
-    right -= scaled(172);
-    if (control < 0)
-        right -= scaled(44);
-    return (RECT){right - scaled(32), scaled(20), right, scaled(52)};
+        return (RECT){client.right - scaled(64), top, client.right - scaled(28), top + scaled(36)};
+    RECT first = card_rect(g_carousel.first + 1), last = card_rect(g_carousel.first + VISIBLE_CARDS);
+    int left = control < 0 ? first.left - scaled(44) : last.right + scaled(12);
+    return (RECT){left, top, left + scaled(32), top + scaled(36)};
 }
 
 static bool can_page(int direction)
@@ -321,96 +478,117 @@ static void select_workspace(unsigned workspace)
 static void draw_control(HDC dc, int control, const wchar_t *caption, bool enabled)
 {
     RECT rect = control_rect(control);
-    fill(dc, &rect, enabled ? RGB(45, 66, 103) : RGB(33, 38, 48));
-    label(dc, caption, rect, enabled ? RGB(233, 240, 255) : RGB(106, 119, 139),
+    if (!enabled)
+        return;
+    if (control == 0 && g_carousel.hover_add) {
+        HBRUSH brush = CreateSolidBrush(RGB(58, 123, 206));
+        HGDIOBJ old_brush = SelectObject(dc, brush), old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+        RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, scaled(10), scaled(10));
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        DeleteObject(brush);
+    }
+    HGDIOBJ previous = SelectObject(dc, g_carousel.heading);
+    label(dc, caption, rect, RGB(245, 248, 252),
           DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SelectObject(dc, previous);
 }
 
 static void draw_tile(HDC dc, size_t index, RECT rect, bool ghost)
 {
-    fill(dc, &rect, ghost ? RGB(69, 96, 146) : RGB(48, 57, 74));
-    RECT inside = rect;
-    InflateRect(&inside, -scaled(2), -scaled(2));
-    fill(dc, &inside, RGB(27, 33, 44));
-    int size = scaled(20);
-    if (g_carousel.items[index].icon)
-        DrawIconEx(dc, rect.left + scaled(10), rect.top + scaled(10), g_carousel.items[index].icon,
-                   size, size, 0, NULL, DI_NORMAL);
-    RECT title = {rect.left + scaled(40), rect.top, rect.right - scaled(8), rect.top + scaled(40)};
-    label(dc, g_carousel.items[index].title, title, RGB(239, 242, 249),
-          DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-    RECT body = preview_area(rect);
+    RECT body = preview_destination(index, rect), shadow = body;
+    InflateRect(&shadow, scaled(4), scaled(4));
+    OffsetRect(&shadow, 0, scaled(4));
+    fill(dc, &shadow, RGB(23, 28, 35));
+    RECT border = body;
+    InflateRect(&border, scaled(2), scaled(2));
+    fill(dc, &border, ghost || index == g_carousel.hovered ? RGB(122, 188, 255) : RGB(95, 107, 122));
     fill(dc, &body, RGB(18, 23, 32));
     if (g_carousel.items[index].icon) {
-        size = scaled(48);
+        int size = scaled(48);
         DrawIconEx(dc, (body.left + body.right - size) / 2, (body.top + body.bottom - size) / 2,
                    g_carousel.items[index].icon, size, size, 0, NULL, DI_NORMAL);
     }
+    SIZE text_size = {0};
+    GetTextExtentPoint32W(dc, g_carousel.items[index].title, (int)wcslen(g_carousel.items[index].title), &text_size);
+    int caption_width = text_size.cx + scaled(48);
+    if (caption_width > rect.right - rect.left)
+        caption_width = rect.right - rect.left;
+    int left = (body.left + body.right - caption_width) / 2;
+    RECT caption = {left, body.bottom + scaled(10), left + caption_width, body.bottom + scaled(36)};
+    HBRUSH brush = CreateSolidBrush(RGB(32, 39, 49));
+    HGDIOBJ old_brush = SelectObject(dc, brush), old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+    RoundRect(dc, caption.left, caption.top, caption.right, caption.bottom, scaled(12), scaled(12));
+    SelectObject(dc, old_pen);
+    SelectObject(dc, old_brush);
+    DeleteObject(brush);
+    if (g_carousel.previews[index].caption_icon)
+        DrawIconEx(dc, caption.left + scaled(6), caption.top + scaled(3), g_carousel.previews[index].caption_icon,
+                   scaled(20), scaled(20), 0, NULL, DI_NORMAL);
+    caption.left += scaled(32);
+    caption.right -= scaled(8);
+    label(dc, g_carousel.items[index].title, caption, RGB(251, 252, 255),
+          DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 }
 
 static void paint(HDC dc, RECT client)
 {
-    fill(dc, &client, RGB(15, 20, 29));
+    if (g_carousel.backdrop_dc)
+        BitBlt(dc, 0, 0, client.right, client.bottom, g_carousel.backdrop_dc, 0, 0, SRCCOPY);
+    else
+        fill(dc, &client, RGB(48, 66, 83));
     SetBkMode(dc, TRANSPARENT);
-    HGDIOBJ previous = SelectObject(dc, g_carousel.heading);
-    RECT controls = control_rect(-1);
-    RECT title = {scaled(40), scaled(18), controls.left - scaled(16), scaled(50)};
+    HGDIOBJ previous = SelectObject(dc, g_carousel.font);
     wchar_t text[96];
-    unsigned last = g_carousel.first + VISIBLE_CARDS;
-    if (last > g_carousel.spaces)
-        last = g_carousel.spaces;
-    swprintf(text, 96, L"Workspaces  %u-%u of %u", g_carousel.first + 1, last, g_carousel.spaces);
-    label(dc, text, title, RGB(248, 249, 252), DT_SINGLELINE | DT_END_ELLIPSIS);
-    SelectObject(dc, g_carousel.font);
-    draw_control(dc, -1, L"<", can_page(-1));
-    draw_control(dc, 1, L">", can_page(1));
-    draw_control(dc, 0, L"+ Add workspace", g_carousel.spaces < MS_MAX_WORKSPACES);
-    draw_control(dc, 2, L"X", true);
-    RECT hint = {scaled(40), scaled(56), client.right - scaled(40), scaled(80)};
-    label(dc, L"Select a workspace to browse  /  Drag an app preview to a workspace  /  Enter to switch  /  Esc to close",
-          hint, RGB(162, 178, 203), DT_SINGLELINE | DT_END_ELLIPSIS);
+    draw_control(dc, -1, L"\x2039", can_page(-1));
+    draw_control(dc, 1, L"\x203a", can_page(1));
+    draw_control(dc, 0, L"+", g_carousel.spaces < MS_MAX_WORKSPACES);
+    draw_control(dc, 2, L"\x00d7", true);
     for (unsigned workspace = g_carousel.first + 1;
          workspace <= g_carousel.spaces && workspace <= g_carousel.first + VISIBLE_CARDS; ++workspace) {
-        RECT card = card_rect(workspace);
+        RECT card = card_body(workspace);
         COLORREF border = g_carousel.dragging && g_carousel.drop == workspace ? RGB(145, 195, 255) :
-                          workspace == g_carousel.view ? RGB(85, 145, 246) : RGB(53, 64, 83);
-        fill(dc, &card, border);
-        RECT inside = card;
-        InflateRect(&inside, -scaled(2), -scaled(2));
-        fill(dc, &inside, RGB(26, 34, 48));
-        swprintf(text, 96, L"Workspace %u%ls", workspace, workspace == g_carousel.active ? L"  -  Active" : L"");
-        RECT header = {card.left + scaled(16), card.top + scaled(12), card.right - scaled(12), card.top + scaled(38)};
-        label(dc, text, header, RGB(230, 237, 249), DT_SINGLELINE | DT_END_ELLIPSIS);
-        swprintf(text, 96, L"%d apps%ls", workspace_count(workspace), workspace == g_carousel.view ? L"  -  Browsing" : L"");
-        header.top += scaled(29);
-        header.bottom += scaled(29);
-        label(dc, text, header, RGB(159, 178, 207), DT_SINGLELINE | DT_END_ELLIPSIS);
-        int x = card.left + scaled(16);
-        for (size_t i = 0; i < g_carousel.count && x + scaled(20) < card.right - scaled(12); ++i) {
-            if (g_carousel.items[i].workspace == workspace && g_carousel.items[i].icon) {
-                DrawIconEx(dc, x, card.bottom - scaled(32), g_carousel.items[i].icon,
-                           scaled(20), scaled(20), 0, NULL, DI_NORMAL);
-                x += scaled(28);
+                          workspace == g_carousel.view ? RGB(96, 174, 255) :
+                          workspace == g_carousel.hover_space ? RGB(207, 221, 239) : RGB(113, 126, 143);
+        RECT outline = card;
+        InflateRect(&outline, scaled(2), scaled(2));
+        fill(dc, &outline, border);
+        if (g_carousel.wallpaper_dc) {
+            SetStretchBltMode(dc, HALFTONE);
+            SetBrushOrgEx(dc, 0, 0, NULL);
+            StretchBlt(dc, card.left, card.top, card.right - card.left, card.bottom - card.top,
+                       g_carousel.wallpaper_dc, 0, 0, client.right, client.bottom, SRCCOPY);
+        } else {
+            fill(dc, &card, RGB(65, 88, 108));
+        }
+        for (size_t i = g_carousel.count; i > 0; --i) {
+            if (g_carousel.items[i - 1].workspace == workspace) {
+                RECT miniature = miniature_rect(i - 1);
+                fill(dc, &miniature, RGB(203, 213, 224));
+                if (!g_carousel.previews[i - 1].miniature && g_carousel.previews[i - 1].miniature_icon &&
+                    miniature.right - miniature.left >= scaled(16) && miniature.bottom - miniature.top >= scaled(16))
+                    DrawIconEx(dc, miniature.left, miniature.top, g_carousel.previews[i - 1].miniature_icon,
+                               scaled(16), scaled(16), 0, NULL, DI_NORMAL);
             }
         }
+        RECT caption = card_rect(workspace);
+        caption.top = card.bottom + scaled(5);
+        swprintf(text, 96, L"Desktop %u%ls", workspace, workspace == g_carousel.active ? L"  \x2022" : L"");
+        label(dc, text, caption, RGB(251, 252, 255), DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
-    SelectObject(dc, g_carousel.heading);
-    swprintf(text, 96, L"Apps in workspace %u", g_carousel.view);
-    RECT heading = {scaled(40), scaled(226), client.right - scaled(40), scaled(260)};
-    label(dc, text, heading, RGB(230, 237, 249), DT_SINGLELINE);
-    SelectObject(dc, g_carousel.font);
     if (!workspace_count(g_carousel.view)) {
-        RECT empty = {scaled(40), scaled(285), client.right - scaled(40), client.bottom - scaled(70)};
-        label(dc, L"This workspace is empty. Drag apps here from another workspace.", empty,
-              RGB(146, 166, 195), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        RECT empty = {scaled(40), strip_height(), client.right - scaled(40), client.bottom - scaled(70)};
+        label(dc, L"An empty desktop. Drag a window onto its preview in the strip above.", empty,
+              RGB(243, 246, 251), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     for (size_t i = 0; i < g_carousel.count; ++i) {
         RECT tile;
-        if (tile_rect(i, &tile))
+        if (!(g_carousel.dragging && g_carousel.pressed == i) &&
+            (g_carousel.progress >= 1.0 || !g_carousel.previews[i].handle) && tile_rect(i, &tile))
             draw_tile(dc, i, tile, false);
     }
-    RECT status = {scaled(40), client.bottom - scaled(48), client.right - scaled(40), client.bottom - scaled(24)};
-    label(dc, g_carousel.message, status, RGB(157, 179, 211), DT_SINGLELINE | DT_END_ELLIPSIS);
+    RECT status = {scaled(32), client.bottom - scaled(38), client.right - scaled(72), client.bottom - scaled(16)};
+    label(dc, g_carousel.message, status, RGB(232, 238, 246), DT_SINGLELINE | DT_END_ELLIPSIS);
     if (g_carousel.dragging && g_carousel.pressed < g_carousel.count)
         draw_tile(dc, g_carousel.pressed, ghost_rect(), true);
     SelectObject(dc, previous);
@@ -427,6 +605,96 @@ static void free_buffer(void)
     g_carousel.buffer = NULL;
     g_carousel.bitmap = NULL;
     g_carousel.old_bitmap = NULL;
+}
+
+static void free_backdrop(void)
+{
+    if (g_carousel.wallpaper_dc && g_carousel.wallpaper_old && g_carousel.wallpaper_old != HGDI_ERROR)
+        SelectObject(g_carousel.wallpaper_dc, g_carousel.wallpaper_old);
+    if (g_carousel.backdrop_dc && g_carousel.backdrop_old && g_carousel.backdrop_old != HGDI_ERROR)
+        SelectObject(g_carousel.backdrop_dc, g_carousel.backdrop_old);
+    if (g_carousel.wallpaper_dc) DeleteDC(g_carousel.wallpaper_dc);
+    if (g_carousel.backdrop_dc) DeleteDC(g_carousel.backdrop_dc);
+    if (g_carousel.wallpaper) DeleteObject(g_carousel.wallpaper);
+    if (g_carousel.backdrop) DeleteObject(g_carousel.backdrop);
+    g_carousel.wallpaper_dc = g_carousel.backdrop_dc = NULL;
+    g_carousel.wallpaper = g_carousel.backdrop = NULL;
+    g_carousel.wallpaper_old = g_carousel.backdrop_old = NULL;
+}
+
+static void prepare_backdrop(void)
+{
+    HWND window = g_carousel.window;
+    HBITMAP wallpaper = ms_wallpaper_load((HMONITOR)g_carousel.monitor);
+    /* Shell COM calls can dispatch display/focus messages while loading. */
+    if (window != g_carousel.window) {
+        if (wallpaper) DeleteObject(wallpaper);
+        return;
+    }
+    g_carousel.wallpaper = wallpaper;
+    if (!g_carousel.wallpaper)
+        return;
+    g_carousel.wallpaper_dc = CreateCompatibleDC(NULL);
+    g_carousel.backdrop_dc = CreateCompatibleDC(NULL);
+    RECT client;
+    GetClientRect(g_carousel.window, &client);
+    BITMAPINFO format = {.bmiHeader = {.biSize = sizeof(BITMAPINFOHEADER),
+        .biWidth = client.right, .biHeight = -client.bottom, .biPlanes = 1, .biBitCount = 32, .biCompression = BI_RGB}};
+    uint32_t *pixels = NULL;
+    g_carousel.backdrop = CreateDIBSection(NULL, &format, DIB_RGB_COLORS, (void **)&pixels, NULL, 0);
+    if (!g_carousel.wallpaper_dc || !g_carousel.backdrop_dc || !g_carousel.backdrop) {
+        free_backdrop();
+        return;
+    }
+    g_carousel.wallpaper_old = SelectObject(g_carousel.wallpaper_dc, g_carousel.wallpaper);
+    g_carousel.backdrop_old = SelectObject(g_carousel.backdrop_dc, g_carousel.backdrop);
+    if (!g_carousel.wallpaper_old || g_carousel.wallpaper_old == HGDI_ERROR ||
+        !g_carousel.backdrop_old || g_carousel.backdrop_old == HGDI_ERROR) {
+        free_backdrop();
+        return;
+    }
+    BitBlt(g_carousel.backdrop_dc, 0, 0, client.right, client.bottom, g_carousel.wallpaper_dc, 0, 0, SRCCOPY);
+    /* A small cached wallpaper image gives the spaces strip a frosted appearance.
+     * Decode, blur and tint once per opening, never during mouse movement. */
+    HDC small_dc = CreateCompatibleDC(g_carousel.wallpaper_dc);
+    int small_width = client.right / 32 + 1, small_height = client.bottom / 32 + 1;
+    HBITMAP small = CreateCompatibleBitmap(g_carousel.wallpaper_dc, small_width, small_height);
+    if (small_dc && small) {
+        HGDIOBJ previous = SelectObject(small_dc, small);
+        SetStretchBltMode(small_dc, HALFTONE);
+        SetBrushOrgEx(small_dc, 0, 0, NULL);
+        StretchBlt(small_dc, 0, 0, small_width, small_height, g_carousel.wallpaper_dc,
+                   0, 0, client.right, client.bottom, SRCCOPY);
+        int saved = SaveDC(g_carousel.backdrop_dc);
+        IntersectClipRect(g_carousel.backdrop_dc, 0, 0, client.right, strip_height());
+        SetStretchBltMode(g_carousel.backdrop_dc, HALFTONE);
+        SetBrushOrgEx(g_carousel.backdrop_dc, 0, 0, NULL);
+        StretchBlt(g_carousel.backdrop_dc, 0, 0, client.right, client.bottom,
+                   small_dc, 0, 0, small_width, small_height, SRCCOPY);
+        RestoreDC(g_carousel.backdrop_dc, saved);
+        SelectObject(small_dc, previous);
+    }
+    if (small_dc) DeleteDC(small_dc);
+    if (small) DeleteObject(small);
+    GdiFlush(); /* Finish GDI writes before editing DIB pixels directly. */
+    int strip = strip_height();
+    for (int y = 0; y < client.bottom; ++y)
+        for (int x = 0; x < client.right; ++x) {
+            size_t index = (size_t)y * (size_t)client.right + (size_t)x;
+            uint32_t pixel = pixels[index];
+            unsigned red = (pixel >> 16) & 255u, green = (pixel >> 8) & 255u, blue = pixel & 255u;
+            if (y < strip) {
+                red = (red * 76 + 185 * 24) / 100;
+                green = (green * 76 + 201 * 24) / 100;
+                blue = (blue * 76 + 219 * 24) / 100;
+            } else {
+                unsigned shade = y < strip + scaled(12) ? 68u + (unsigned)((y - strip) * 14 / scaled(12)) : 82u;
+                red = red * shade / 100;
+                green = green * shade / 100;
+                blue = blue * shade / 100;
+            }
+            pixels[index] = red << 16 | green << 8 | blue;
+        }
 }
 
 static bool ensure_buffer(HDC dc, int width, int height)
@@ -601,7 +869,12 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
             RECT client;
             GetClientRect(window, &client);
             if (ensure_buffer(dc, client.right, client.bottom)) {
+                int saved = SaveDC(g_carousel.buffer);
+                if (saved)
+                    IntersectClipRect(g_carousel.buffer, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom);
                 paint(g_carousel.buffer, client);
+                if (saved)
+                    RestoreDC(g_carousel.buffer, saved);
                 BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right - ps.rcPaint.left,
                        ps.rcPaint.bottom - ps.rcPaint.top, g_carousel.buffer, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
             } else {
@@ -613,6 +886,43 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
         return 0;
     }
     case WM_ERASEBKGND: return 1;
+    case WM_OVERVIEW_FRAME: {
+        if (window != g_carousel.window || wparam != g_carousel.generation || g_carousel.progress >= 1.0)
+            return 0;
+        /* Posted frame messages otherwise precede hardware input in GetMessage.
+         * Drain a bounded amount of input before the next compositor update. */
+        MSG input;
+        for (unsigned i = 0; i < 32 && PeekMessageW(&input, NULL, 0, 0, PM_REMOVE | PM_QS_INPUT); ++i) {
+            if (input.message == WM_QUIT) {
+                PostQuitMessage((int)input.wParam);
+                finish_entrance();
+                return 0;
+            }
+            TranslateMessage(&input);
+            DispatchMessageW(&input);
+            if (window != g_carousel.window || wparam != g_carousel.generation || g_carousel.progress >= 1.0)
+                return 0;
+        }
+        if (window != g_carousel.window || wparam != g_carousel.generation || g_carousel.progress >= 1.0)
+            return 0; /* PeekMessage can dispatch sent close/display messages. */
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        double elapsed = (double)(now.QuadPart - g_carousel.started.QuadPart) * 1000.0 /
+                         (double)g_carousel.frequency.QuadPart;
+        g_carousel.progress = ms_overview_progress(elapsed);
+        /* DWM owns all moving pixels. Do not repaint full-screen GDI wallpaper,
+         * borders or captions alongside independently presented thumbnails. */
+        sync_previews();
+        bool paced = SUCCEEDED(DwmFlush());
+        if (window == g_carousel.window && wparam == g_carousel.generation) {
+            if (g_carousel.progress >= 1.0) {
+                InvalidateRect(window, NULL, FALSE); /* Paint settled borders/captions once. */
+            } else if (!paced || !PostMessageW(window, WM_OVERVIEW_FRAME, g_carousel.generation, 0)) {
+                finish_entrance();
+            }
+        }
+        return 0;
+    }
     case WM_LBUTTONDBLCLK: {
         POINT point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         unsigned workspace = card_at(point);
@@ -624,6 +934,8 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
     }
     case WM_LBUTTONDOWN: {
         POINT point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        size_t hit = tile_at(point);
+        finish_entrance();
         if (over_taskbar(point))
             return 0;
         RECT add = control_rect(0), close = control_rect(2);
@@ -657,7 +969,11 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
             select_workspace(workspace);
             return 0;
         }
-        g_carousel.pressed = tile_at(point);
+        if (hit == SIZE_MAX && point.y > strip_height()) {
+            activate_workspace();
+            return 0;
+        }
+        g_carousel.pressed = hit;
         g_carousel.origin = point;
         if (g_carousel.pressed != SIZE_MAX) {
             SetFocus(window);
@@ -666,8 +982,21 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
         return 0;
     }
     case WM_MOUSEMOVE:
+    {
+        POINT point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        RECT previous_ghost = ghost_rect();
+        bool was_dragging = g_carousel.dragging;
+        unsigned previous_drop = g_carousel.drop;
+        g_carousel.pointer = point;
+        RECT add = control_rect(0);
+        bool hover_add = !over_taskbar(point) && PtInRect(&add, point) && g_carousel.spaces < MS_MAX_WORKSPACES;
+        if (hover_add != g_carousel.hover_add) {
+            g_carousel.hover_add = hover_add;
+            InvalidateRect(window, NULL, FALSE);
+        }
+        TRACKMOUSEEVENT tracking = {.cbSize = sizeof(tracking), .dwFlags = TME_LEAVE, .hwndTrack = window};
+        TrackMouseEvent(&tracking);
         if (g_carousel.pressed < g_carousel.count && (wparam & MK_LBUTTON)) {
-            POINT point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
             if (abs(point.x - g_carousel.origin.x) >= GetSystemMetrics(SM_CXDRAG) ||
                 abs(point.y - g_carousel.origin.y) >= GetSystemMetrics(SM_CYDRAG))
                 g_carousel.dragging = true;
@@ -682,15 +1011,59 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
             }
             if (g_carousel.dragging)
                 SetCursor(LoadCursorW(NULL, IDC_SIZEALL));
-            InvalidateRect(window, NULL, FALSE);
+            if (was_dragging) {
+                /* Move only the ghost's old/new pixels, plus changed targets.
+                 * WM_PAINT coalesces high-rate mouse events into one update. */
+                RECT next_ghost = ghost_rect();
+                InflateRect(&previous_ghost, scaled(8), scaled(12));
+                InflateRect(&next_ghost, scaled(8), scaled(12));
+                InvalidateRect(window, &previous_ghost, FALSE);
+                InvalidateRect(window, &next_ghost, FALSE);
+                if (previous_drop != g_carousel.drop) {
+                    RECT strip;
+                    GetClientRect(window, &strip);
+                    strip.bottom = strip_height();
+                    InvalidateRect(window, &strip, FALSE);
+                }
+            } else {
+                InvalidateRect(window, NULL, FALSE); /* Remove the source tile once. */
+            }
+        } else {
+            size_t hovered = tile_at(point);
+            unsigned space = card_at(point);
+            if (hovered != g_carousel.hovered || space != g_carousel.hover_space) {
+                g_carousel.hovered = hovered;
+                g_carousel.hover_space = space;
+                InvalidateRect(window, NULL, FALSE);
+            }
         }
         return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_carousel.hovered = SIZE_MAX;
+        g_carousel.hover_space = 0;
+        g_carousel.hover_add = false;
+        InvalidateRect(window, NULL, FALSE);
+        return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lparam) == HTCLIENT) {
+            SetCursor(LoadCursorW(NULL, g_carousel.dragging ? IDC_SIZEALL :
+                g_carousel.hovered < g_carousel.count || g_carousel.hover_space || g_carousel.hover_add ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
+        break;
     case WM_LBUTTONUP: {
         POINT point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         unsigned destination = card_at(point);
         size_t pressed = g_carousel.pressed;
-        bool move = g_carousel.dragging && destination && pressed < g_carousel.count;
-        bool focus = !g_carousel.dragging && pressed < g_carousel.count && tile_at(point) == pressed;
+        RECT add = control_rect(0);
+        bool create = g_carousel.dragging && !over_taskbar(point) && PtInRect(&add, point) &&
+            g_carousel.spaces < MS_MAX_WORKSPACES && pressed < g_carousel.count;
+        bool move = g_carousel.dragging && (destination || create) && pressed < g_carousel.count;
+        bool focus = !g_carousel.dragging && pressed < g_carousel.count &&
+            (tile_at(point) == pressed ||
+             (abs(point.x - g_carousel.origin.x) < GetSystemMetrics(SM_CXDRAG) &&
+              abs(point.y - g_carousel.origin.y) < GetSystemMetrics(SM_CYDRAG)));
         MSCarouselItem item = {0};
         if (move || focus)
             item = g_carousel.items[pressed];
@@ -702,10 +1075,15 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
             activate(monitor, item.window, item.process);
         } else if (move) {
             g_carousel.busy = true;
-            g_carousel.actions.move(g_carousel.monitor, item.window, item.process, destination, g_carousel.message, 256);
+            if (create)
+                destination = g_carousel.actions.add(g_carousel.monitor, g_carousel.message, 256);
+            if (window == g_carousel.window && destination)
+                g_carousel.actions.move(g_carousel.monitor, item.window, item.process, destination, g_carousel.message, 256);
             if (window == g_carousel.window) {
                 if (!refresh())
                     wcscpy(g_carousel.message, L"Could not refresh apps. Press F5 to retry.");
+                if (create && destination)
+                    g_carousel.first = g_carousel.spaces > VISIBLE_CARDS ? g_carousel.spaces - VISIBLE_CARDS : 0;
                 g_carousel.busy = false;
                 SetForegroundWindow(window);
                 SetFocus(window);
@@ -736,6 +1114,7 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
         return 0;
     case WM_CANCELMODE: cancel_drag(); return 0;
     case WM_MOUSEWHEEL:
+        finish_entrance();
         if (g_carousel.view) {
             g_carousel.scroll[g_carousel.view - 1] += GET_WHEEL_DELTA_WPARAM(wparam) > 0 ? -1 : 1;
             MSOverviewGrid layout = grid();
@@ -744,6 +1123,7 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
         }
         return 0;
     case WM_KEYDOWN:
+        finish_entrance();
         if (wparam == VK_ESCAPE)
             ms_carousel_close();
         else if (wparam == VK_RETURN && !g_carousel.dragging)
@@ -776,6 +1156,7 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
         cancel_drag();
         free_snapshot(g_carousel.items, g_carousel.previews, g_carousel.count);
         free_buffer();
+        free_backdrop();
         if (g_carousel.font)
             DeleteObject(g_carousel.font);
         if (g_carousel.heading)
@@ -784,6 +1165,7 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
         return 0;
     default: return DefWindowProcW(window, message, wparam, lparam);
     }
+    return DefWindowProcW(window, message, wparam, lparam);
 }
 
 bool ms_carousel_open(HINSTANCE instance, MSHandle monitor, const MSCarouselActions *actions)
@@ -800,6 +1182,9 @@ bool ms_carousel_open(HINSTANCE instance, MSHandle monitor, const MSCarouselActi
     g_carousel.bounds = info.rcMonitor;
     g_carousel.actions = *actions;
     g_carousel.pressed = SIZE_MAX;
+    g_carousel.hovered = SIZE_MAX;
+    g_carousel.progress = 1.0;
+    g_carousel.generation = ++g_generation;
     g_carousel.dpi = 96;
     g_carousel.window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, CAROUSEL_CLASS,
         L"Monitor Spaces overview", WS_POPUP, info.rcMonitor.left, info.rcMonitor.top,
@@ -814,18 +1199,56 @@ bool ms_carousel_open(HINSTANCE instance, MSHandle monitor, const MSCarouselActi
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     g_carousel.heading = CreateFontW(-scaled(21), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
-    wcscpy(g_carousel.message, L"Drag previews to a workspace above. Scroll for more apps. Move to the taskbar edge to reveal it. F5 refreshes.");
+    g_carousel.busy = true;
+    HWND window = g_carousel.window;
+    prepare_backdrop();
+    if (window != g_carousel.window)
+        return false;
+    wcscpy(g_carousel.message, L"Drag windows to a desktop or + to create one. Enter switches desktop. Esc returns.");
     if (!g_carousel.font || !g_carousel.heading || !refresh()) {
         ms_carousel_close();
         return false;
     }
+    g_carousel.busy = false;
     select_workspace(g_carousel.active);
     if (!SetTimer(g_carousel.window, TIMER_TASKBAR, 50, NULL)) {
         ms_carousel_close();
         return false;
     }
+    BOOL animate = FALSE, composition = FALSE;
+    bool entrance = !GetSystemMetrics(SM_REMOTESESSION) &&
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animate, 0) && animate &&
+        SUCCEEDED(DwmIsCompositionEnabled(&composition)) && composition &&
+        QueryPerformanceFrequency(&g_carousel.frequency) && g_carousel.frequency.QuadPart > 0;
+    if (entrance) {
+        update_layout();
+        bool moving = false;
+        for (size_t i = 0; i < g_carousel.count; ++i)
+            if (g_carousel.previews[i].visible && g_carousel.previews[i].handle)
+                moving = true;
+        entrance = moving;
+    }
+    if (entrance)
+        g_carousel.progress = 0.0;
+    SetPropW(g_carousel.window, L"NonRudeHWND", (HANDLE)1);
     ShowWindow(g_carousel.window, SW_SHOW);
     SetForegroundWindow(g_carousel.window);
     SetFocus(g_carousel.window);
+    if (window != g_carousel.window)
+        return true;
+    /* Allocate buffers, compute layout and present initial thumbnails before
+     * starting the animation clock, so startup work cannot consume its frames. */
+    RedrawWindow(window, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    if (window != g_carousel.window)
+        return true;
+    if (entrance) {
+        if (SUCCEEDED(DwmFlush())) {
+            QueryPerformanceCounter(&g_carousel.started);
+            if (!PostMessageW(window, WM_OVERVIEW_FRAME, g_carousel.generation, 0))
+                finish_entrance();
+        } else {
+            finish_entrance();
+        }
+    }
     return true;
 }

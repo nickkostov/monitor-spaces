@@ -60,11 +60,33 @@ HD/4K/8K, and `INT_MAX`; elapsed time beyond the duration is clamped. This valid
 slide geometry, not Windows capture, painting, or animation smoothness.
 
 `tests/test_overview.c` validates the same portable layout functions used by the
-full-screen overview: preview-grid bounds and non-overlap, reaching the last app
+full-screen overview: floating-preview bounds and non-overlap, centered incomplete
+rows, three-window and nine-window layouts without scrolling at 1280×720, reaching the last app
 through scrolling, negative monitor coordinates, 100/150/200% scaling, tiny/empty
-and invalid viewports, landscape/portrait aspect fitting, and taskbar-edge strips
+and invalid viewports, landscape/portrait aspect fitting, wallpaper cover fitting,
+miniature projection/clipping from negative/offscreen window coordinates, and taskbar-edge strips
 on all four edges. These tests exercise geometry and hit boundaries, not native
 DWM thumbnails or Explorer's taskbar behavior.
+
+`tests/test_fullscreen.c` compiles the actual `src/fullscreen_win32.c` with a small
+host-side Win32 boundary in `tests/win32_stubs`. It exercises recovery journal
+ordering, denied writes before frame/position changes, style/registry failures,
+failed-placement recovery with retained retry data, negative monitor coordinates,
+idle polling without repeated resizing, interrupted-run recovery, Explorer restart
+without overwriting the original taskbar setting, existing shell properties,
+minimized/maximized restoration, exclusions, and saved mode preference. Sanitizers
+run the same code. The boundary supplies API results; these checks do not execute
+Explorer, actual Windows styles, taskbar auto-hide, or foreign app callbacks.
+
+Overview animation tests also sample fractional frame times for 60, 75, 120,
+144, 165, and 240 Hz. They verify monotonic easing and rectangle interpolation,
+exact endpoints, negative/large coordinates, invalid times, and movement between
+sub-millisecond samples that used to be truncated to the same frame time.
+The Win32 entrance now updates DWM positions without per-frame GDI painting.
+It caches target/start/miniature geometry, primes the first frame before starting
+the clock, and draws borders/captions once settled. A bounded input drain avoids
+posted frame messages starving hardware input. Drag painting uses clipped dirty
+regions. These are implementation changes, not measured Windows frame-rate results.
 
 The renderer now submits whole frames with `UpdateLayeredWindow`, measures elapsed
 time with `QueryPerformanceCounter`, and uses `DwmFlush` presentation pacing
@@ -190,8 +212,17 @@ Use two physical displays and ordinary test windows with no unsaved work:
     presents the final incoming frame before removing the overlay, repeated
     shortcuts do not flash the underlying desktop, and input/recovery stay usable.
 16. Point at each monitor and press Win+Up. Verify full-monitor coverage, the four
-    workspace cards, separate active/browsing highlights, app previews/icons/titles,
-    empty states, and preview-grid wheel scrolling.
+    miniature desktops over the softened wallpaper strip, active dot/browsing
+    outline, floating app previews with icons/titles below them, hover outlines,
+    centered incomplete rows, empty states, and wheel scrolling.
+    Verify the 400 ms eased entrance follows compositor pacing; quick clicks,
+    keyboard navigation, closing/reopening, reduced-motion settings, and Remote
+    Desktop must not leave stale frames or block input. Check clicking a moving
+    preview opens that app and clicking wallpaper activates the browsed desktop.
+    Compare entrance and dragging at 60/120/144/165/240 Hz, with several live app
+    previews and at 4K/mixed DPI. Verify labels appear after zooming, stationary
+    icon fallbacks remain usable, dragging leaves no trails, drop highlights clear,
+    and input during the entrance responds without waiting for it to finish.
     Drag apps active→inactive, inactive→inactive, and inactive→active; verify
     membership when switching afterward, original minimized/maximized state,
     taskbar retention, and the other monitor's independence. Test owner/dialog
@@ -205,7 +236,7 @@ Use two physical displays and ordinary test windows with no unsaved work:
     suppresses native maximization while running, and Win+Shift+Up/Win+Ctrl+Up
     pass through. Test negative coordinates and 100/150/200% DPI; verify focus
     and GDI/icon resources return to normal after repeated opening/closing.
-17. Add workspace 5 with the carousel's **+ Add workspace** control. Confirm the
+17. Add workspace 5 with the strip's **+** control. Confirm the
     active workspace, window assignments, and other monitor's count stay unchanged.
     Page with < / >, drag an app across pages by hovering over an arrow, cancel a
     drag on an arrow/outside the window, and move apps among spaces 1, 5, 10, and
@@ -216,19 +247,66 @@ Use two physical displays and ordinary test windows with no unsaved work:
     malformed/missing/out-of-range values and denied registry writes: defaults
     or a clear save-failure message should result, without losing app recovery.
     Confirm only Ctrl+Alt+0–4 is registered and no extra shortcut conflicts appear.
+    Drop an app onto **+**: exactly one workspace should be added and the app
+    group should move into it. Cancel outside +, test the 99-space limit, denied
+    registry/property writes, and an app exiting during the drop. A failed move
+    may leave the new empty space; recovery tags must still protect the app.
 18. With the overview open, confirm the taskbar is covered until hovering at its
     screen edge, remains usable while the pointer is over it, and is covered
     again after moving away. Test normal and auto-hide taskbars, primary and
     secondary taskbars, each supported screen edge, negative coordinates, and
     different DPI/refresh rates. Select apps and Start from the revealed taskbar,
     restart Explorer, and close/kill the utility while the taskbar is covered or
-    revealed. The actual taskbar must remain visible according to its existing
-    settings afterward; no shell visibility/auto-hide preference may be changed.
+    revealed. The overview itself must leave shell visibility alone. Full-screen
+    app mode temporarily enables Windows auto-hide; disabling that mode/Restore
+    and exit must restore its original preference. After killing the utility,
+    run --restore to recover the saved taskbar preference as well as app layouts.
     Cancel a drag over the revealed taskbar and confirm no workspace move occurs.
     Check live/minimized/protected app previews, aspect ratios, popup groups,
     closed windows, source sizes changing, and repeated refresh/open/close for
     thumbnail/GDI/icon leaks. Opening or browsing previews must not unminimize
     source windows or change their geometry or workspace membership.
+19. Check the wallpaper against the Windows desktop on each monitor: JPEG/PNG/BMP,
+    different per-monitor images, solid colors, slideshow changes after reopening,
+    and fill/fit/stretch/center/tile/span settings. Test unreadable/unavailable
+    wallpaper and image-decoder failures; the overview must remain usable with a
+    color fallback. Check miniature app positions for normal, maximized, minimized,
+    partially offscreen windows and a top/left taskbar. Reopen/refresh repeatedly
+    and change displays during wallpaper loading; COM objects, DIBs, DCs, icons,
+    and both thumbnail relationships must be released.
+20. Check app icons at 100/125/150/200/250% DPI in captions, miniature fallbacks,
+    and the large icon fallback when DWM previews are unavailable. Compare apps
+    exposing only a 16-pixel small window icon but larger executable resources,
+    DPI-aware large window icons, legacy/monochrome icons, transparent edges,
+    Store apps, elevated/inaccessible processes, and apps exiting during refresh.
+    Verify filtering preserves transparency without dark halos, artwork is not
+    enlarged from the small title-bar icon when a larger source is available,
+    and generic/existing window icons remain available if extraction fails.
+    Repeated F5/open/close and display changes during icon loading must release
+    all owned large/caption/miniature HICONs, WIC/COM objects and temporary bitmaps,
+    preserve other apps' shared icon handles, and keep zoom/drag rendering free
+    of icon extraction or scaling work. Native icon quality needs Windows review.
+21. With **Full-screen apps and auto-hide taskbar** checked in the tray menu,
+    verify normal resizable apps fill their monitor without standard frame/title
+    bars during normal use, across workspace switches, and after preview activation.
+    New foreground windows should enter within 250 ms and background windows
+    within one second. Dialogs/tool/fixed-size/already-borderless/minimized/hung
+    apps and denied windows must not be resized. Test custom chrome, maximized
+    apps, top/left taskbars, multiple monitors, mixed DPI and native app F11 modes.
+    Hover at each taskbar's edge: it must reveal above the app, accept app/Start/
+    tray clicks, and hide again when leaving. Never hide the actual taskbar HWND.
+    Auto-hide's work-area change must not disable the mode/reset workspaces a
+    second later; actual display removal/reconfiguration must still recover.
+    Turn the mode off while some apps are in inactive spaces: styles/normal
+    placements must restore without revealing those apps or losing membership.
+    Test original normal/maximized states, user-minimized windows, focus on another
+    monitor, repeated toggles, registry/property/placement denials, and Explorer
+    restart. Check the original auto-hide value when it starts both on and off.
+    Kill the utility after entering full screen, then run --restore: frames,
+    placements and taskbar preference must recover from HWND/registry records.
+    A normal restart should recover first, then apply the saved mode preference.
+    Restore/Ctrl+Alt+0 must leave the mode off for that run; the tray toggle can
+    re-enable it. Failed restoration must keep journals and report recovery errors.
 
 These simulations do not validate Windows message delivery, actual property
 lifetime after process termination, application responsiveness, focus behavior,
@@ -247,4 +325,11 @@ mapping, and multi-digit tray drawing also require live Windows validation.
 The full-screen overview's DWM thumbnail rendering, explicit app activation,
 region-based taskbar reveal, auto-hide interaction, and persistent drawing buffer
 also require live Windows validation. Automated overview checks cover geometry.
+The Mission Control-style painting, wallpaper COM/WIC loading and positioning,
+dual DWM previews, entrance pacing, hover/click interactions, and drag-to-create
+also require live Windows validation; successful cross-compilation and portable
+geometry/sanitizer tests do not establish their visual appearance or smoothness.
+Full-screen app geometry/style changes, the NonRudeHWND shell hint, real auto-hide
+edge reveal, taskbar preference restoration, and Windows placement recovery still
+require live Windows validation. Host boundary tests validate recovery logic only.
 The packaged executable is unsigned.

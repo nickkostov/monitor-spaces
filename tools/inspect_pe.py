@@ -63,7 +63,8 @@ def inspect(path: Path) -> dict:
                 functions.add(data[start:data.index(b"\0", start)].decode("ascii"))
             thunk += 8
         cursor += 20
-    allowed = {"ADVAPI32.dll", "KERNEL32.dll", "USER32.dll", "GDI32.dll", "SHELL32.dll", "dwmapi.dll", "msvcrt.dll"}
+    allowed = {"ADVAPI32.dll", "KERNEL32.dll", "USER32.dll", "GDI32.dll", "SHELL32.dll", "dwmapi.dll", "msvcrt.dll",
+               "ole32.dll", "windowscodecs.dll"}
     require({name.lower() for name in imports} <= {name.lower() for name in allowed},
             f"Unexpected runtime dependency: {imports}")
     require({"user32.dll", "dwmapi.dll", "kernel32.dll"} <= {name.lower() for name in imports},
@@ -80,7 +81,10 @@ def inspect(path: Path) -> dict:
                       "ReleaseCapture", "GetAncestor", "SendMessageTimeoutW", "CopyIcon",
                       "EnumDisplayDevicesW", "RegGetValueW", "RegCreateKeyExW", "RegSetValueExW", "RegCloseKey",
                       "DwmRegisterThumbnail", "DwmUnregisterThumbnail", "DwmUpdateThumbnailProperties",
-                      "DwmQueryThumbnailSourceSize", "CreateRectRgn", "SetWindowRgn", "GetLastActivePopup", "SHAppBarMessage"}
+                      "DwmQueryThumbnailSourceSize", "CreateRectRgn", "SetWindowRgn", "GetLastActivePopup", "SHAppBarMessage",
+                      "CoInitializeEx", "CoUninitialize", "CoCreateInstance", "CoTaskMemFree", "WICConvertBitmapSource",
+                      "GetIconInfo", "OpenProcess", "QueryFullProcessImageNameW", "SHDefExtractIconW",
+                      "GetWindowPlacement", "SetWindowPlacement", "SetWindowLongPtrW", "IsHungAppWindow", "RegDeleteValueW"}
     require(workspace_apis <= functions, "Missing expected workspace API imports")
     require(any(name == ".rsrc" for name, *_ in sections), "Missing resource section")
     require("PerMonitorV2".encode() in data, "Missing per-monitor DPI manifest")

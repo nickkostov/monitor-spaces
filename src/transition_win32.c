@@ -8,6 +8,7 @@
 
 #include "slide.h"
 #include "transition_win32.h"
+#include "fullscreen_win32.h"
 
 static const wchar_t OVERLAY_CLASS[] = L"MonitorSpaces.Slide.v1";
 enum { WM_SLIDE_FRAME = WM_APP + 100 };
@@ -201,6 +202,8 @@ void ms_transition_begin(HMONITOR monitor, int direction)
         cancel_overlay();
         return;
     }
+    if (ms_fullscreen_enabled())
+        info.rcWork = info.rcMonitor;
     ++g_slide.generation;
     if (g_slide.overlay && EqualRect(&g_slide.area, &info.rcWork)) {
         /* Keep the overlay on screen. Continue from exactly the pixels already
@@ -212,7 +215,7 @@ void ms_transition_begin(HMONITOR monitor, int direction)
         return;
     }
     cancel_overlay();
-    g_slide.area = info.rcWork; /* Keep taskbars and adjacent monitors stationary. */
+    g_slide.area = info.rcWork; /* Full monitor in full-screen mode; otherwise work area. */
     g_slide.width = info.rcWork.right - info.rcWork.left;
     g_slide.height = info.rcWork.bottom - info.rcWork.top;
     g_slide.direction = direction;
