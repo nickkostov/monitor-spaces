@@ -1,11 +1,11 @@
 # Verification
 
-Verified on 2026-11-21 using Linux-hosted tools. The GUI executable was inspected
+Verified on 2026-11-22 using Linux-hosted tools. The GUI executable was inspected
 without launching it on the host's Windows desktop.
 
 ## Automated checks completed
 
-`make test` compiles `src/workspaces.c` with the native C compiler and runs ten
+`make test` compiles `src/workspaces.c` with the native C compiler and runs fourteen
 workspace simulation scenarios against the same workspace engine linked into the GUI:
 
 1. Two monitors switch independently; a window opened in workspace 2 returns
@@ -32,9 +32,22 @@ workspace simulation scenarios against the same workspace engine linked into the
     original membership across all four workspaces. Selecting another workspace
     reveals only its tagged windows, leaves the other monitor independent, and
     recovery after process-state loss still clears every inactive membership.
+11. Moving apps between active and inactive workspaces changes only their
+    membership, leaves active monitor workspaces untouched, handles repeat
+    selection and invalid destinations, and remains recoverable after interruption.
+12. Owner/popup group moves tag every member before minimizing. Denied writes
+    roll back new and existing membership; hidden/ineligible tagged windows can
+    move, and failed reveals remain tagged and can be retried.
+13. Monitors start with four spaces, grow independently, preserve their active
+    workspace when adding, and wrap navigation through their configured counts.
+    Invalid saved counts, shrinking requests, and values above 99 are rejected. Recovery
+    preserves counts, and a newly discovered monitor accepts a valid saved count.
+14. Apps opened in additional spaces retain membership, can move into extra
+    spaces through the same engine used by the carousel, and remain independent
+    of the other monitor. Tags 10 and 99 recover correctly even before counts load.
 
 `make test` also compiles `src/navigation.c` and exercises input sequences for
-both Win keys, left/right navigation, repeat suppression, release order, overlapping
+both Win keys, left/right navigation, Win+Up overview commands, repeat suppression, release order, overlapping
 arrow presses, and holding both Win keys. Plain arrows, other Win shortcuts,
 extra Ctrl/Alt/Shift modifiers, and arrows held before Win pass through.
 Shell menu masking is requested once per Win hold. These are state-machine tests;
@@ -45,6 +58,13 @@ left/right wraparound, direct numbered selection, monotonic progress, no gaps
 between outgoing/incoming images, and exact endpoints. Widths include odd sizes,
 HD/4K/8K, and `INT_MAX`; elapsed time beyond the duration is clamped. This validates
 slide geometry, not Windows capture, painting, or animation smoothness.
+
+`tests/test_overview.c` validates the same portable layout functions used by the
+full-screen overview: preview-grid bounds and non-overlap, reaching the last app
+through scrolling, negative monitor coordinates, 100/150/200% scaling, tiny/empty
+and invalid viewports, landscape/portrait aspect fitting, and taskbar-edge strips
+on all four edges. These tests exercise geometry and hit boundaries, not native
+DWM thumbnails or Explorer's taskbar behavior.
 
 The renderer now submits whole frames with `UpdateLayeredWindow`, measures elapsed
 time with `QueryPerformanceCounter`, and uses `DwmFlush` presentation pacing
@@ -169,6 +189,46 @@ Use two physical displays and ordinary test windows with no unsaved work:
     mixed refresh-rate setups, with many apps and under load. Confirm every slide
     presents the final incoming frame before removing the overlay, repeated
     shortcuts do not flash the underlying desktop, and input/recovery stay usable.
+16. Point at each monitor and press Win+Up. Verify full-monitor coverage, the four
+    workspace cards, separate active/browsing highlights, app previews/icons/titles,
+    empty states, and preview-grid wheel scrolling.
+    Drag apps active→inactive, inactive→inactive, and inactive→active; verify
+    membership when switching afterward, original minimized/maximized state,
+    taskbar retention, and the other monitor's independence. Test owner/dialog
+    groups, separate windows of the same app, elevated apps, and app termination
+    or relocation while the carousel is open. F5 must refresh the snapshot.
+    Check Escape, outside clicks, Win+Up repeat/release order, lost mouse capture,
+    dropping outside cards, and display/recovery/exit during a drag: canceled
+    drags must not move apps. Verify clicking cards browses, double-click/Enter
+    switches workspace, and clicking a preview activates its app (including
+    originally minimized windows and owned dialogs). Verify Win+Up
+    suppresses native maximization while running, and Win+Shift+Up/Win+Ctrl+Up
+    pass through. Test negative coordinates and 100/150/200% DPI; verify focus
+    and GDI/icon resources return to normal after repeated opening/closing.
+17. Add workspace 5 with the carousel's **+ Add workspace** control. Confirm the
+    active workspace, window assignments, and other monitor's count stay unchanged.
+    Page with < / >, drag an app across pages by hovering over an arrow, cancel a
+    drag on an arrow/outside the window, and move apps among spaces 1, 5, 10, and
+    99. Check first/last page bounds, max-count disabled state, two-digit tray
+    icons, tooltips/panel totals, and wrapping at each monitor's own last space.
+    Restart and reconnect/reconfigure displays; counts must reload from the
+    current user's registry values while apps recover to workspace 1. Test
+    malformed/missing/out-of-range values and denied registry writes: defaults
+    or a clear save-failure message should result, without losing app recovery.
+    Confirm only Ctrl+Alt+0–4 is registered and no extra shortcut conflicts appear.
+18. With the overview open, confirm the taskbar is covered until hovering at its
+    screen edge, remains usable while the pointer is over it, and is covered
+    again after moving away. Test normal and auto-hide taskbars, primary and
+    secondary taskbars, each supported screen edge, negative coordinates, and
+    different DPI/refresh rates. Select apps and Start from the revealed taskbar,
+    restart Explorer, and close/kill the utility while the taskbar is covered or
+    revealed. The actual taskbar must remain visible according to its existing
+    settings afterward; no shell visibility/auto-hide preference may be changed.
+    Cancel a drag over the revealed taskbar and confirm no workspace move occurs.
+    Check live/minimized/protected app previews, aspect ratios, popup groups,
+    closed windows, source sizes changing, and repeated refresh/open/close for
+    thumbnail/GDI/icon leaks. Opening or browsing previews must not unminimize
+    source windows or change their geometry or workspace membership.
 
 These simulations do not validate Windows message delivery, actual property
 lifetime after process termination, application responsiveness, focus behavior,
@@ -180,4 +240,11 @@ not execute these Win32 calls.
 The slide overlay, capture exclusion, per-window DWM transition suppression,
 reduced-motion fallback, resource cleanup, and interruption behavior have been
 reviewed in source and cross-compiled but still require live Windows validation.
+The Win+Up carousel's native painting, focus, drag capture, icons, and interaction
+also require live Windows validation; automated tests cover input and membership.
+The add-space control, paging/drag hover timer, registry persistence, monitor ID
+mapping, and multi-digit tray drawing also require live Windows validation.
+The full-screen overview's DWM thumbnail rendering, explicit app activation,
+region-based taskbar reveal, auto-hide interaction, and persistent drawing buffer
+also require live Windows validation. Automated overview checks cover geometry.
 The packaged executable is unsigned.

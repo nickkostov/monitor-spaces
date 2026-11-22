@@ -1,12 +1,14 @@
 # Monitor Spaces
 
-A small C/Win32 utility giving each monitor four workspaces. Point at a display
-and use a shortcut to switch just that display. Every monitor starts on workspace 1.
+A small C/Win32 utility giving each monitor four workspaces by default, expandable
+to 99. Point at a display and use a shortcut to switch just that display. Every
+monitor starts on workspace 1; added workspace counts are remembered per monitor.
 
 | Control | Action |
 | --- | --- |
-| Win + Left | Previous workspace on the monitor under the pointer; workspace 1 wraps to 4 |
-| Win + Right | Next workspace on the monitor under the pointer; workspace 4 wraps to 1 |
+| Win + Left | Previous workspace on the monitor under the pointer; workspace 1 wraps to its last workspace |
+| Win + Right | Next workspace on the monitor under the pointer; its last workspace wraps to 1 |
+| Win + Up | Open/close a full-screen app overview on the monitor under the pointer; drag previews to workspaces |
 | Ctrl + Alt + 1–4 | Switch the monitor under the pointer to workspace 1–4 |
 | Ctrl + Alt + 0 | Restore all managed windows; reset all monitors to workspace 1 |
 | Restore all button | Same as Ctrl + Alt + 0 |
@@ -31,7 +33,7 @@ presentation pacing. Repeated shortcuts continue from the currently displayed
 image; window-state changes share a composition barrier across the workspace.
 
 Use the number row above the letters. The numeric keypad is not registered.
-The app starts in the background. A small number (1–4) in the taskbar's notification
+The app starts in the background. A small workspace number in the taskbar's notification
 area shows the active workspace on the monitor under the pointer. It updates
 immediately after switching and checks pointer movement every 250 ms. Hover over
 the icon for the display number/device and workspace. Windows chooses the location
@@ -46,7 +48,7 @@ Only one instance runs per Windows session. Running another copy opens its panel
 The app recreates its icon after Explorer restarts and retries failed icon updates.
 If the icon cannot be created at startup, the panel opens as a fallback.
 
-Win + Left/Right takes over those combinations while the utility runs. Press an
+Win + Left/Right/Up takes over those combinations while the utility runs. Press an
 arrow again for each step; holding it does not cycle repeatedly. Both Win keys
 work. Combinations with additional Ctrl, Alt, or Shift modifiers pass through,
 including Win + Ctrl + Left/Right and Win + Shift + Left/Right.
@@ -69,9 +71,59 @@ unsigned. Live Windows behavior has not been verified; see [VERIFICATION.md](VER
 
 If a required shortcut cannot be registered, the utility reports which shortcut
 failed and exits before switching any windows. Startup recovery still runs.
-Win + Left/Right uses a dedicated keyboard-hook thread because Windows reserves
+Win + Left/Right/Up uses a dedicated keyboard-hook thread because Windows reserves
 Win-key shortcuts. If the hook cannot be installed, startup reports the error and
 exits. **Restore and exit** removes the hook and restores normal key handling.
+
+## Organize apps with Win + Up
+
+Point at a monitor and press **Win + Up**. A borderless, full-screen overview
+shows four workspace cards across the top and a large app-preview grid below.
+The actual active workspace is marked separately from the workspace being browsed.
+Click a workspace card to browse its apps without switching your desktop. Scroll
+to reach more previews, click a preview to open that app, or double-click a
+workspace / press **Enter** to switch to the workspace being browsed. Plain
+Left/Right arrows browse workspaces inside the overview.
+Click **+ Add workspace** to create another space on that monitor, up to 99.
+Adding a space preserves the active workspace and all app assignments. Use
+**< / >** to browse additional cards; while dragging an app, hover over an arrow
+for half a second to page without releasing it. Win+Left/Right cycles through
+every configured space, while Ctrl+Alt+1–4 retains the original direct shortcuts.
+Drag an app preview onto a workspace card to move that app. Dropping onto an inactive
+workspace minimizes it there; dropping onto the active workspace restores it
+according to its saved state. Moving an app does not switch your current
+workspace or change the other monitor's workspace. Owned dialogs on the same
+monitor move with their app; separate main windows can be moved independently.
+
+Press **F5** to refresh opened/closed windows. **Esc**, the top-right **X**,
+switching focus to another app, or **Win + Up** again closes the overview.
+Dropping outside the workspace cards, losing mouse capture, or closing mid-drag
+cancels the move. Restore, exit, and display changes also close the overview. The utility rechecks the app
+at drop time, and denied property writes are rolled back before minimizing the
+group. Failed operations retain recovery tags for **Ctrl + Alt + 0**.
+
+The overview covers the selected monitor's taskbar. Move the pointer to the
+taskbar's screen edge to reveal it; move back into the overview to cover it
+again. This works by temporarily cutting a taskbar-sized strip out of the
+overview window. Taskbar visibility and auto-hide settings are never changed,
+and closing or terminating the utility removes the covering window. Other
+monitors keep their normal taskbars. Opening a taskbar app or Start can dismiss
+the overview as focus changes.
+
+App previews use DWM thumbnails and preserve the source window's aspect ratio.
+Opening/browsing the overview does not maximize, restore, or move application
+windows. Minimized apps can show their last available frame; unsupported or
+protected previews may show an app icon or blank content instead. The overview
+organizes Monitor Spaces workspaces independently of Windows' own Win+Tab desktops.
+
+Workspace counts are saved for the current Windows user under
+`HKEY_CURRENT_USER\Software\MonitorSpaces\WorkspaceCounts`, keyed by the monitor
+interface ID when available (otherwise its display name). Counts reload on launch
+and display reconfiguration. New monitors start with four; invalid saved values
+are ignored. If a count cannot be saved, the new space still works for that run
+and the carousel reports the save failure. Restoring all windows resets the active
+workspace to 1 and preserves the configured counts. Window-to-workspace membership
+is not persisted across a restart; startup recovery brings all managed windows back.
 
 ## Window behavior
 
@@ -118,12 +170,15 @@ start their own restore animation before foreground polling detects the selectio
 ## Recovery
 
 The stable, namespaced `MonitorSpaces.HiddenWorkspace.v1` window property stores
-an integer from 1 to 4 on the foreign window itself. It contains no pointer into
+an integer from 1 to 99 on the foreign window itself. It contains no pointer into
 the utility's memory, so surviving windows can be found after an unexpected exit.
 The tag is written before minimizing and removed only after restoration is confirmed.
 `MonitorSpaces.OriginalState.v1` stores the original normal/minimized/maximized
 state as another integer property. Failed operations retain their tags for recovery.
 Startup also restores windows hidden by older versions that lack the state property.
+Recovery accepts all supported tags even before saved counts are loaded. Before
+using an older executable that only recognizes spaces 1–4, restore all windows
+with this version so that extra-space windows are no longer tagged.
 
 Recovery scans all tagged top-level windows, including ones no longer eligible
 or attached to the original monitor. It runs at startup, on Ctrl + Alt + 0, on
