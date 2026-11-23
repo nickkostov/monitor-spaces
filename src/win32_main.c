@@ -500,7 +500,10 @@ static bool show_window(void *context, MSHandle handle)
     } else if (IsIconic(window) || !IsWindowVisible(window)) {
         ms_show_without_animation(window, state == SW_SHOWMAXIMIZED ? SW_SHOWMAXIMIZED : SW_SHOWNOACTIVATE);
     }
-    ms_fullscreen_apply(window);
+    /* Overview drops preserve app sizing. Apply automatic full-screen only for
+     * ordinary workspace activation, after the overview has closed. */
+    if (!ms_carousel_visible())
+        ms_fullscreen_apply(window);
     return !IsWindow(window) || (IsWindowVisible(window) &&
         (state == SW_SHOWMINIMIZED || !IsIconic(window)));
 }
@@ -822,13 +825,18 @@ static bool carousel_move(MSHandle monitor, MSHandle handle, DWORD process, unsi
     }
     MSResult result = {0};
     bool moved = found && ms_move(&g_state, monitor, destination, windows.items, count, &OPERATIONS, &result);
+    if (moved && !result.errors) {
+        for (size_t i = 0; i < count; ++i)
+            if (!ms_fullscreen_preserve_size((HWND)windows.items[i].id))
+                ++result.errors;
+    }
     free(windows.items);
     if (!moved)
         swprintf(message, capacity, L"The app closed or changed displays. Press F5 to refresh.");
     else if (result.errors)
         swprintf(message, capacity, L"Move incomplete (%zu errors). Ctrl+Alt+0 can restore managed windows.", result.errors);
     else
-        swprintf(message, capacity, L"App moved to workspace %u.", destination);
+        swprintf(message, capacity, L"App moved to workspace %u with its window size preserved.", destination);
     g_busy = false;
     update_panel();
     return moved && !result.errors;

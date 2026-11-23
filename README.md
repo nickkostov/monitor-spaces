@@ -63,6 +63,14 @@ checked every second. Dialogs, tool windows, fixed-size windows, already-borderl
 apps, minimized windows, and windows that cannot be managed keep their normal
 behavior. App controls drawn inside the client area can remain visible.
 
+Dragging an app to a workspace in **Win + Up** preserves its window size and frame.
+If this mode had made the app borderless full-screen, the drop restores its saved
+windowed layout on its current monitor, fitting inside the work area only if
+necessary. That app stays exempt from automatic full-screen when switching
+workspaces, opening its preview, or selecting it through the taskbar. Windows
+already at a user-chosen size keep that layout. Turning full-screen mode off and
+on again resets these exceptions; recovery/restarting also clears them.
+
 The mode enables Windows' taskbar auto-hide. Move to the taskbar's screen edge
 to reveal it; moving away lets Windows hide it again. The setting applies to all
 Windows taskbars. App windows remain below the taskbar when it reveals, and the
@@ -148,6 +156,8 @@ workspace minimizes it there; dropping onto the active workspace restores it
 according to its saved state. Moving an app does not switch your current
 workspace or change the other monitor's workspace. Owned dialogs on the same
 monitor move with their app; separate main windows can be moved independently.
+Successful drops also preserve the app group's windowed sizes instead of forcing
+full-screen. This includes dropping onto **+** to add a desktop and move there.
 
 Press **F5** to refresh opened/closed windows. **Esc**, the bottom-right **×**,
 switching focus to another app, or **Win + Up** again closes the overview.

@@ -6,12 +6,14 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <stdint.h>
+#include <limits.h>
 
 #include "fullscreen_win32.h"
 
 static const wchar_t SETTINGS[] = L"Software\\MonitorSpaces";
 static const wchar_t BAR_SAVED[] = L"OriginalTaskbarAutoHide.v1";
 static const wchar_t MARK[] = L"MonitorSpaces.Fullscreen.v1.{52617889-437D-4910-B50A-70607E152BC2}";
+static const wchar_t PRESERVE_SIZE[] = L"MonitorSpaces.PreserveSize.v1.{52617889-437D-4910-B50A-70607E152BC2}";
 static const wchar_t NONRUDE[] = L"NonRudeHWND";
 static const wchar_t OLD_NONRUDE[] = L"MonitorSpaces.Fullscreen.NonRude.v1.{52617889-437D-4910-B50A-70607E152BC2}";
 /* All values live on the foreign HWND as encoded integers, never local pointers.
@@ -180,7 +182,7 @@ static bool restore_nonrude(HWND window)
     return GetPropW(window, NONRUDE) == NULL;
 }
 
-static bool restore_window(HWND window)
+static bool restore_window(HWND window, HMONITOR keep_monitor)
 {
     if (!IsWindow(window))
         return true;
@@ -188,6 +190,36 @@ static bool restore_window(HWND window)
     DWORD original;
     if (!read_window(window, &original, &placement) || IsHungAppWindow(window))
         return false;
+    if (keep_monitor) {
+        MONITORINFO info = {.cbSize = sizeof(info)};
+        if (!GetMonitorInfoW(keep_monitor, &info))
+            return false;
+        /* A full-screen app may have been moved to another physical monitor.
+         * Restore its windowed size on the drop's monitor, fitting only when
+         * necessary. WINDOWPLACEMENT uses workspace, rather than screen, coords. */
+        int64_t width = (int64_t)placement.rcNormalPosition.right - placement.rcNormalPosition.left;
+        int64_t height = (int64_t)placement.rcNormalPosition.bottom - placement.rcNormalPosition.top;
+        int64_t available_width = (int64_t)info.rcWork.right - info.rcWork.left;
+        int64_t available_height = (int64_t)info.rcWork.bottom - info.rcWork.top;
+        if (width <= 0 || height <= 0 || available_width <= 0 || available_height <= 0 ||
+            available_width > INT_MAX || available_height > INT_MAX)
+            return false;
+        if (width > available_width) width = available_width;
+        if (height > available_height) height = available_height;
+        int64_t left = placement.rcNormalPosition.left, top = placement.rcNormalPosition.top;
+        /* Main windows' work-area offsets cancel when expressing these limits
+         * in the placement's coordinate space, including top/left taskbars. */
+        if (left < info.rcMonitor.left) left = info.rcMonitor.left;
+        if (top < info.rcMonitor.top) top = info.rcMonitor.top;
+        if (left + width > (int64_t)info.rcMonitor.left + available_width)
+            left = (int64_t)info.rcMonitor.left + available_width - width;
+        if (top + height > (int64_t)info.rcMonitor.top + available_height)
+            top = (int64_t)info.rcMonitor.top + available_height - height;
+        RECT fitted = {(LONG)left, (LONG)top, (LONG)(left + width), (LONG)(top + height)};
+        if (!EqualRect(&fitted, &placement.rcNormalPosition))
+            placement.ptMaxPosition = (POINT){-1, -1};
+        placement.rcNormalPosition = fitted;
+    }
     bool minimized = IsIconic(window) != FALSE, visible = IsWindowVisible(window) != FALSE;
     DWORD current = (DWORD)GetWindowLongPtrW(window, GWL_STYLE);
     DWORD frame = WS_CAPTION | WS_THICKFRAME;
@@ -210,10 +242,30 @@ static bool restore_window(HWND window)
     return !GetPropW(window, MARK);
 }
 
+bool ms_fullscreen_preserve_size(HWND window)
+{
+    if (!IsWindow(window))
+        return true;
+    bool saved = GetPropW(window, MARK) != NULL;
+    if (!g_enabled && !saved)
+        return true;
+    /* Set the exception before restoring: focus/restore callbacks and future
+     * polling must not immediately turn this window full-screen again. */
+    if (!SetPropW(window, PRESERVE_SIZE, (HANDLE)1))
+        return false;
+    if (!saved)
+        return true;
+    HWND foreground = GetForegroundWindow();
+    bool restored = restore_window(window, MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST));
+    if (IsWindow(foreground) && IsWindowVisible(foreground) && !IsIconic(foreground))
+        SetForegroundWindow(foreground);
+    return restored;
+}
+
 void ms_fullscreen_apply(HWND window)
 {
     if (!g_enabled || !g_eligible || !IsWindow(window) || !IsWindowVisible(window) ||
-        IsIconic(window) || IsHungAppWindow(window))
+        IsIconic(window) || IsHungAppWindow(window) || GetPropW(window, PRESERVE_SIZE))
         return;
     bool saved = GetPropW(window, MARK) != NULL;
     DWORD style = (DWORD)GetWindowLongPtrW(window, GWL_STYLE);
@@ -241,7 +293,7 @@ void ms_fullscreen_apply(HWND window)
         if (!saved) {
             if (restore_nonrude(window)) discard_journal(window);
         } else {
-            restore_window(window);
+            restore_window(window, NULL);
         }
         return;
     }
@@ -268,8 +320,14 @@ void ms_fullscreen_update(void)
 
 static BOOL CALLBACK recover_window(HWND window, LPARAM parameter)
 {
-    if (GetPropW(window, MARK) && !restore_window(window))
+    if (GetPropW(window, MARK) && !restore_window(window, NULL)) {
         ++*(size_t *)parameter;
+    } else {
+        /* A new full-screen session can manage every app again. Exceptions on
+         * surviving HWNDs are also cleaned up during startup/crash recovery. */
+        RemovePropW(window, PRESERVE_SIZE);
+        if (GetPropW(window, PRESERVE_SIZE)) ++*(size_t *)parameter;
+    }
     return TRUE;
 }
 

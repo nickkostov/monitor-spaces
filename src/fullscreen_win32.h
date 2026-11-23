@@ -12,6 +12,9 @@ bool ms_fullscreen_enable(void);
 void ms_fullscreen_suspend(void);
 void ms_fullscreen_save_preference(bool enabled);
 void ms_fullscreen_apply(HWND window);
+/* Exempt a moved app from automatic full-screen and undo this mode's resizing.
+ * Windows not resized by this mode keep their current geometry and frame. */
+bool ms_fullscreen_preserve_size(HWND window);
 void ms_fullscreen_update(void);
 unsigned ms_fullscreen_original_state(HWND window);
 /* Disables the mode and restores window journals/taskbar state, even after a crash. */

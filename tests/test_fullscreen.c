@@ -192,8 +192,84 @@ static void minimized_and_exclusions(void)
     puts("PASS fullscreen minimized/maximized state, pre-existing auto-hide/shell properties, owned/tool/fixed/hung exclusions");
 }
 
+static void preserve_dragged_size(void)
+{
+    reset(); DWORD original_style=windows[0].style; RECT original=windows[0].rect;
+    assert(ms_fullscreen_enable());
+    assert(ms_fullscreen_preserve_size(&windows[0]));
+    assert(windows[0].style==original_style && EqualRect(&windows[0].rect,&original));
+    assert(ms_fullscreen_original_state(&windows[0])==0);
+    unsigned mutations=windows[0].mutations;
+    ms_fullscreen_apply(&windows[0]); ms_fullscreen_update();
+    assert(windows[0].mutations==mutations);
+    assert(ms_fullscreen_enabled() && (bar_state & ABS_AUTOHIDE));
+    windows[0].style |= WS_MINIMIZE; /* Moving to an inactive workspace. */
+    ms_fullscreen_update();
+    windows[0].style &= ~WS_MINIMIZE; /* Workspace return / taskbar activation. */
+    ms_fullscreen_apply(&windows[0]);
+    assert(windows[0].mutations==mutations && EqualRect(&windows[0].rect,&original));
+
+    windows[1]=windows[0]; windows[1].count=0; windows[1].mutations=0;
+    ms_fullscreen_update(); /* Other apps still use the selected full-screen mode. */
+    assert(!(windows[1].style & WS_CAPTION));
+    assert(windows[0].style==original_style);
+    assert(ms_fullscreen_restore()==0 && !windows[0].count);
+    assert(ms_fullscreen_enable()); /* An explicit new session resets exceptions. */
+    assert(!(windows[0].style & WS_CAPTION));
+
+    reset(); windows[1]=windows[0];
+    windows[1].style=0; /* Window opened after the last full-screen scan. */
+    assert(ms_fullscreen_enable());
+    windows[1].style=original_style;
+    mutations=windows[1].mutations;
+    assert(ms_fullscreen_preserve_size(&windows[1]));
+    ms_fullscreen_apply(&windows[1]); ms_fullscreen_update();
+    assert(windows[1].mutations==mutations && windows[1].style==original_style);
+    assert(EqualRect(&windows[1].rect,&original));
+
+    reset();
+    windows[0].placement.rcNormalPosition=(RECT){100,100,900,700}; /* Saved on a different monitor. */
+    windows[0].rect=windows[0].placement.rcNormalPosition;
+    assert(ms_fullscreen_enable() && ms_fullscreen_preserve_size(&windows[0]));
+    RECT fitted=windows[0].placement.rcNormalPosition;
+    assert(fitted.right-fitted.left==800 && fitted.bottom-fitted.top==600);
+    assert(fitted.left>=-1920 && fitted.top>=-1080 && fitted.right<=0 && fitted.bottom<=-40);
+    reset();
+    windows[0].placement.rcNormalPosition=(RECT){-2000,-1200,3000,1800};
+    windows[0].rect=windows[0].placement.rcNormalPosition;
+    assert(ms_fullscreen_enable() && ms_fullscreen_preserve_size(&windows[0]));
+    fitted=windows[0].placement.rcNormalPosition;
+    assert(fitted.right-fitted.left==1920 && fitted.bottom-fitted.top==1040);
+    assert(windows[0].style==original_style); /* Fit oversized windows, retaining the frame. */
+
+    reset(); windows[0].style |= WS_MAXIMIZE; windows[0].placement.showCmd=SW_SHOWMAXIMIZED;
+    assert(ms_fullscreen_enable());
+    windows[0].style |= WS_MINIMIZE;
+    assert(ms_fullscreen_preserve_size(&windows[0]));
+    assert(IsIconic(&windows[0]) && (windows[0].style & WS_CAPTION));
+    assert(windows[0].placement.flags & WPF_RESTORETOMAXIMIZED);
+    assert(EqualRect(&windows[0].placement.rcNormalPosition,&original));
+
+    reset(); assert(ms_fullscreen_enable()); mutations=windows[0].mutations;
+    deny_property=property_writes+1;
+    assert(!ms_fullscreen_preserve_size(&windows[0]));
+    assert(windows[0].mutations==mutations); /* No resize without a durable exception. */
+    deny_property=0; deny_placement=TRUE;
+    assert(!ms_fullscreen_preserve_size(&windows[0]));
+    assert(ms_fullscreen_original_state(&windows[0])==SW_SHOWNORMAL);
+    mutations=windows[0].mutations;
+    ms_fullscreen_update(); assert(windows[0].mutations==mutations);
+    deny_placement=FALSE;
+    assert(ms_fullscreen_preserve_size(&windows[0]));
+    assert(EqualRect(&windows[0].rect,&original));
+    ms_fullscreen_suspend(); /* Recovery clears surviving drag exceptions. */
+    assert(ms_fullscreen_restore()==0 && !windows[0].count);
+    reset(); assert(ms_fullscreen_preserve_size(&windows[0]) && !windows[0].count);
+    puts("PASS dragged apps: preserve frame/size across polling and workspace return, restore inactive/maximized state, retry failures, reset exceptions");
+}
+
 int main(void)
 {
-    lifecycle(); failures(); minimized_and_exclusions();
+    lifecycle(); failures(); minimized_and_exclusions(); preserve_dragged_size();
     return 0;
 }

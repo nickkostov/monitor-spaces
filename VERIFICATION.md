@@ -77,6 +77,12 @@ without overwriting the original taskbar setting, existing shell properties,
 minimized/maximized restoration, exclusions, and saved mode preference. Sanitizers
 run the same code. The boundary supplies API results; these checks do not execute
 Explorer, actual Windows styles, taskbar auto-hide, or foreign app callbacks.
+The same boundary tests verify drag exceptions: restoring pre-full-screen geometry
+and frames, preserving newly opened window sizes, remaining windowed across
+polling/minimize/return, restoring inactive maximized apps without revealing them,
+keeping auto-hide enabled, resetting exceptions, and retrying denied/failed restores.
+Fit checks also cover saved layouts from a different physical monitor and sizes
+larger than the drop monitor, keeping the normal frame and avoiding offscreen placement.
 
 Overview animation tests also sample fractional frame times for 60, 75, 120,
 144, 165, and 240 Hz. They verify monotonic easing and rectangle interpolation,
@@ -305,6 +311,14 @@ Use two physical displays and ordinary test windows with no unsaved work:
     Kill the utility after entering full screen, then run --restore: frames,
     placements and taskbar preference must recover from HWND/registry records.
     A normal restart should recover first, then apply the saved mode preference.
+    Drag normal and auto-full-screen apps onto inactive/active workspaces, the
+    same workspace, and **+**. Successful drops must restore the saved windowed
+    size/frame and keep it after waiting for polling, switching away/back, clicking
+    its preview, or taskbar activation. Newly opened/resized apps must retain their
+    current layout. Check minimized/maximized apps and owner/dialog groups. Failed
+    or canceled moves must not create size exceptions; failed layout restoration
+    after a successful membership move must report an incomplete operation and
+    retain recovery data. Explicit off/on and recovery should clear exceptions.
     Restore/Ctrl+Alt+0 must leave the mode off for that run; the tray toggle can
     re-enable it. Failed restoration must keep journals and report recovery errors.
 
