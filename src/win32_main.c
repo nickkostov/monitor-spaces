@@ -637,8 +637,19 @@ static void load_workspace_counts(void)
         wchar_t id[128];
         display_settings_id(&g_displays.items[i], id);
         DWORD count = 0, bytes = sizeof(count);
-        if (RegGetValueW(HKEY_CURRENT_USER, COUNTS_KEY, id, RRF_RT_REG_DWORD, NULL, &count, &bytes) == ERROR_SUCCESS)
-            ms_set_workspace_count(&g_state, (MSHandle)g_displays.items[i].handle, count);
+        if (RegGetValueW(HKEY_CURRENT_USER, COUNTS_KEY, id, RRF_RT_REG_DWORD, NULL, &count, &bytes) == ERROR_SUCCESS &&
+            count >= MS_MIN_WORKSPACES && count <= MS_MAX_WORKSPACES) {
+            MSHandle monitor = (MSHandle)g_displays.items[i].handle;
+            /* Loading follows global recovery and fresh monitor initialization;
+             * no live workspace memberships are being discarded here. */
+            while (ms_workspace_count(&g_state, monitor) > count) {
+                MSResult result;
+                if (!ms_remove_workspace(&g_state, monitor, ms_workspace_count(&g_state, monitor),
+                                         NULL, 0, &OPERATIONS, &result))
+                    break;
+            }
+            ms_set_workspace_count(&g_state, monitor, count);
+        }
     }
 }
 
@@ -693,6 +704,13 @@ static bool sync_displays(void)
 
 static void switch_on_monitor(HMONITOR target, unsigned workspace, int navigation)
 {
+    unsigned spaces = ms_workspace_count(&g_state, (MSHandle)target);
+    if (spaces && (!workspace || workspace > spaces)) {
+        swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
+                 L"This display has %u desktop%ls. Win+Up opens the overview to add more.",
+                 spaces, spaces == 1 ? L"" : L"s");
+        return;
+    }
     if (ms_active(&g_state, (MSHandle)target) == workspace) {
         swprintf(g_message, sizeof(g_message) / sizeof(g_message[0]),
             L"The display under the pointer is already on workspace %u.", workspace);
@@ -874,6 +892,40 @@ static unsigned carousel_add(MSHandle monitor, wchar_t *message, size_t capacity
     return count;
 }
 
+static bool carousel_remove(MSHandle monitor, unsigned workspace, wchar_t *message, size_t capacity)
+{
+    if (g_busy)
+        return false;
+    g_busy = true;
+    if (!sync_displays() || !ms_carousel_visible()) {
+        g_busy = false;
+        return false;
+    }
+    Windows windows;
+    if (!snapshot_windows(&windows)) {
+        swprintf(message, capacity, L"Could not read the app windows. The desktop stays open.");
+        g_busy = false;
+        return false;
+    }
+    MSResult result;
+    bool removed = ms_remove_workspace(&g_state, monitor, workspace,
+                                       windows.items, windows.count, &OPERATIONS, &result);
+    free(windows.items);
+    bool saved = removed && save_workspace_count(monitor, ms_workspace_count(&g_state, monitor));
+    if (result.errors)
+        swprintf(message, capacity, L"%ls (%zu errors). Ctrl+Alt+0 retries window recovery.",
+                 removed ? L"Desktop closed; some apps need recovery" : L"Desktop stays open", result.errors);
+    else if (!removed)
+        swprintf(message, capacity, L"Keep at least one desktop on this monitor.");
+    else if (!saved)
+        swprintf(message, capacity, L"Desktop %u closed; the new count could not be saved for next launch.", workspace);
+    else
+        swprintf(message, capacity, L"Desktop %u closed. Its apps were kept on the neighboring desktop.", workspace);
+    update_panel();
+    g_busy = false;
+    return removed;
+}
+
 static void carousel_focus(MSHandle monitor, MSHandle handle, DWORD process)
 {
     if (g_busy)
@@ -919,7 +971,8 @@ static void toggle_carousel(void)
     if (!GetCursorPos(&cursor))
         return;
     MSHandle monitor = (MSHandle)MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-    const MSCarouselActions actions = {carousel_load, carousel_move, carousel_activate, carousel_add, carousel_focus};
+    const MSCarouselActions actions = {carousel_load, carousel_move, carousel_activate, carousel_add, carousel_focus,
+                                       carousel_remove};
     if (!ms_carousel_open(GetModuleHandleW(NULL), monitor, &actions)) {
         wcscpy(g_message, L"Could not open the workspace overview.");
         MessageBoxW(g_panel, g_message, L"Monitor Spaces", MB_OK | MB_ICONERROR);

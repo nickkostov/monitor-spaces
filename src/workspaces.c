@@ -41,7 +41,7 @@ unsigned ms_workspace_count(const MSState *state, MSHandle monitor)
 
 bool ms_set_workspace_count(MSState *state, MSHandle monitor, unsigned count)
 {
-    if (count < MS_DEFAULT_WORKSPACES || count > MS_MAX_WORKSPACES)
+    if (count < MS_MIN_WORKSPACES || count > MS_MAX_WORKSPACES)
         return false;
     for (size_t i = 0; i < state->count; ++i) {
         if (state->monitors[i].id == monitor) {
@@ -189,6 +189,64 @@ bool ms_move(const MSState *state, MSHandle monitor, unsigned destination,
         for (size_t i = count; i > 0; --i)
             if (windows[i - 1].prepared)
                 reveal(&windows[i - 1], ops, result);
+    return true;
+}
+
+static unsigned after_removal(unsigned workspace, unsigned removed)
+{
+    if (workspace == removed)
+        return removed > 1 ? removed - 1 : 1;
+    return workspace > removed ? workspace - 1 : workspace;
+}
+
+bool ms_remove_workspace(MSState *state, MSHandle monitor, unsigned workspace,
+                         MSWindow *windows, size_t count, const MSOperations *ops, MSResult *result)
+{
+    *result = (MSResult){0};
+    unsigned spaces = ms_workspace_count(state, monitor);
+    if (spaces <= MS_MIN_WORKSPACES || !workspace || workspace > spaces)
+        return false;
+    for (size_t i = 0; i < count; ++i)
+        windows[i].prepared = false;
+    /* Leave old snapshot tags intact until every changed membership is saved.
+     * No app is hidden, resized, or closed by deleting a workspace. */
+    for (size_t i = 0; i < count; ++i) {
+        MSWindow *window = &windows[i];
+        if (window->monitor != monitor || !ms_valid_tag(window->tag))
+            continue;
+        unsigned mapped = after_removal(window->tag, workspace);
+        if (mapped == window->tag)
+            continue;
+        if (!ops->set_tag(ops->context, window->id, mapped)) {
+            ++result->errors;
+            for (size_t j = 0; j < i; ++j) {
+                MSWindow *previous = &windows[j];
+                if (previous->prepared) {
+                    if (!ops->set_tag(ops->context, previous->id, previous->tag))
+                        ++result->errors;
+                    previous->prepared = false;
+                }
+            }
+            return false;
+        }
+        window->prepared = true;
+    }
+    unsigned active = after_removal(ms_active(state, monitor), workspace);
+    for (size_t i = 0; i < count; ++i)
+        if (windows[i].prepared) {
+            windows[i].tag = after_removal(windows[i].tag, workspace);
+            windows[i].prepared = false;
+        }
+    for (size_t i = 0; i < state->count; ++i)
+        if (state->monitors[i].id == monitor) {
+            state->monitors[i].active = active;
+            --state->monitors[i].workspaces;
+        }
+    /* Reveal the merged workspace, owners before popups, without touching other
+     * monitors. A failed reveal retains its new valid tag for recovery. */
+    for (size_t i = count; i > 0; --i)
+        if (windows[i - 1].monitor == monitor && windows[i - 1].tag == active)
+            reveal(&windows[i - 1], ops, result);
     return true;
 }
 

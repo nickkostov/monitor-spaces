@@ -10,6 +10,8 @@ typedef struct {
     MSWindow windows[WINDOW_LIMIT];
     size_t count;
     MSHandle fail_tag, fail_hide, fail_show, fail_clear;
+    MSHandle fail_undo;
+    unsigned undo_tag;
     MSHandle owner, popup;
     size_t mutations;
     bool require_all_tagged;
@@ -39,7 +41,7 @@ static bool tag(void *context, MSHandle id, unsigned workspace)
 {
     Desktop *desktop = context;
     ++desktop->mutations;
-    if (desktop->fail_tag == id)
+    if (desktop->fail_tag == id || (desktop->fail_undo == id && workspace == desktop->undo_tag))
         return false;
     find(desktop, id)->tag = workspace;
     return true;
@@ -115,6 +117,14 @@ static MSResult restore(MSState *state, Desktop *desktop)
     MSResult result;
     ms_restore(state, snapshot, desktop->count, &ops, &result);
     return result;
+}
+
+static bool remove_space(MSState *state, Desktop *desktop, MSHandle monitor, unsigned workspace, MSResult *result)
+{
+    MSWindow snapshot[WINDOW_LIMIT];
+    memcpy(snapshot, desktop->windows, desktop->count * sizeof(*snapshot));
+    MSOperations ops = operations(desktop);
+    return ms_remove_workspace(state, monitor, workspace, snapshot, desktop->count, &ops, result);
 }
 
 static MSResult move_group(const MSState *state, Desktop *desktop, MSHandle monitor,
@@ -477,7 +487,7 @@ static void expandable_workspace_counts(void)
     assert(ms_workspace_count(&state, RIGHT) == 4 && ms_adjacent(&state, RIGHT, -1) == 4);
     assert(ms_adjacent(&state, LEFT, -1) == 12);
     assert(!ms_set_workspace_count(&state, LEFT, 4)); /* Cannot shrink/strand windows. */
-    assert(!ms_set_workspace_count(&state, RIGHT, 3)); /* Invalid persisted count. */
+    assert(!ms_set_workspace_count(&state, RIGHT, 3)); /* Shrinking must merge apps through removal. */
     assert(!ms_set_workspace_count(&state, RIGHT, MS_MAX_WORKSPACES + 1));
     assert(!ms_set_workspace_count(&state, 999, 8));
     assert(ms_set_workspace_count(&state, RIGHT, MS_MAX_WORKSPACES));
@@ -537,6 +547,138 @@ static void added_workspace_membership_and_recovery(void)
     puts("PASS extra-space window membership, carousel moves, two-digit tags, and recovery before counts load");
 }
 
+static void closing_workspaces_keeps_apps(void)
+{
+    /* Every active/removed combination: first, middle, last, current and inactive. */
+    for (unsigned active = 1; active <= 5; ++active) {
+        for (unsigned removed = 1; removed <= 5; ++removed) {
+            Desktop desktop = {.keep_visible = true};
+            MSState state = start();
+            assert(ms_add_workspace(&state, LEFT) == 5);
+            MSHandle apps[5];
+            MSHandle other = open_window(&desktop, RIGHT, true, true);
+            switch_to(&state, &desktop, RIGHT, 3);
+            for (unsigned workspace = 1; workspace <= 5; ++workspace) {
+                switch_to(&state, &desktop, LEFT, workspace);
+                apps[workspace - 1] = open_window(&desktop, LEFT, true, true);
+            }
+            switch_to(&state, &desktop, LEFT, active);
+            MSResult result;
+            assert(remove_space(&state, &desktop, LEFT, removed, &result));
+            assert(!result.errors && !result.hidden && ms_workspace_count(&state, LEFT) == 4);
+            unsigned new_active = active >= removed && active > 1 ? active - 1 : active;
+            assert(ms_active(&state, LEFT) == new_active);
+            for (unsigned workspace = 1; workspace <= 5; ++workspace) {
+                unsigned mapped = workspace >= removed && workspace > 1 ? workspace - 1 : workspace;
+                assert(find(&desktop, apps[workspace - 1])->tag == (mapped == new_active ? 0 : mapped));
+            }
+            assert(ms_active(&state, RIGHT) == 3 && ms_workspace_count(&state, RIGHT) == 4);
+            assert(find(&desktop, other)->tag == 1);
+            /* New apps belong to the merged current workspace; ordinary switches
+             * and global recovery must continue to work with renumbered tags. */
+            MSHandle added = open_window(&desktop, LEFT, true, true);
+            switch_to(&state, &desktop, LEFT, new_active == 4 ? 1 : 4);
+            assert(find(&desktop, added)->tag == new_active);
+            state = start(); /* Interrupted process: recover from HWND tags only. */
+            result = restore(&state, &desktop);
+            assert(!result.errors);
+            for (size_t i = 0; i < desktop.count; ++i)
+                assert(desktop.windows[i].visible && !desktop.windows[i].tag);
+        }
+    }
+    puts("PASS all active/closed desktop combinations, neighboring app merges, renumbering, monitor isolation, and recovery");
+}
+
+static void closing_down_to_one_workspace(void)
+{
+    Desktop desktop = {0};
+    MSState state = start();
+    MSHandle panel = open_window(&desktop, LEFT, true, false);
+    MSHandle hidden = open_window(&desktop, LEFT, false, true);
+    MSHandle app = open_window(&desktop, LEFT, true, true);
+    switch_to(&state, &desktop, LEFT, 4);
+    MSHandle fourth = open_window(&desktop, LEFT, true, true);
+    MSResult result;
+    for (unsigned count = 4; count > 1; --count) {
+        assert(remove_space(&state, &desktop, LEFT, 1, &result));
+        assert(!result.errors && ms_workspace_count(&state, LEFT) == count - 1);
+    }
+    assert(ms_active(&state, LEFT) == 1 && ms_adjacent(&state, LEFT, -1) == 1 && ms_adjacent(&state, LEFT, 1) == 1);
+    assert(find(&desktop, app)->visible && !find(&desktop, app)->tag);
+    assert(find(&desktop, fourth)->visible && !find(&desktop, fourth)->tag);
+    assert(find(&desktop, panel)->visible && !find(&desktop, panel)->tag);
+    assert(!find(&desktop, hidden)->visible && !find(&desktop, hidden)->tag);
+    size_t mutations = desktop.mutations;
+    assert(!remove_space(&state, &desktop, LEFT, 1, &result) && !result.errors);
+    assert(!remove_space(&state, &desktop, RIGHT, 0, &result));
+    assert(!remove_space(&state, &desktop, RIGHT, 5, &result));
+    assert(!remove_space(&state, &desktop, 999, 1, &result));
+    assert(desktop.mutations == mutations);
+    assert(ms_add_workspace(&state, LEFT) == 2);
+    assert(ms_add_workspace(&state, LEFT) == 3);
+    switch_to(&state, &desktop, LEFT, 3);
+    assert(find(&desktop, app)->tag == 1 && find(&desktop, fourth)->tag == 1);
+    assert(!restore(&state, &desktop).errors && ms_workspace_count(&state, LEFT) == 3);
+    assert(ms_workspace_count(&state, RIGHT) == 4);
+    /* Startup may load a saved count below the default after global recovery. */
+    state = start();
+    MSOperations ops = operations(&desktop);
+    for (unsigned count = 4; count > 2; --count)
+        assert(ms_remove_workspace(&state, LEFT, count, NULL, 0, &ops, &result));
+    assert(ms_workspace_count(&state, LEFT) == 2 && ms_active(&state, LEFT) == 1);
+    assert(ms_set_workspace_count(&state, LEFT, MS_MAX_WORKSPACES));
+    MSHandle group[] = {app};
+    assert(!move_group(&state, &desktop, LEFT, MS_MAX_WORKSPACES, group, 1).errors);
+    assert(remove_space(&state, &desktop, LEFT, 50, &result) && !result.errors);
+    assert(ms_workspace_count(&state, LEFT) == 98 && find(&desktop, app)->tag == 98);
+    switch_to(&state, &desktop, LEFT, 98);
+    assert(find(&desktop, app)->visible && !find(&desktop, app)->tag);
+    assert(remove_space(&state, &desktop, LEFT, 98, &result) && !result.errors);
+    assert(ms_active(&state, LEFT) == 97 && ms_workspace_count(&state, LEFT) == 97);
+    assert(!restore(&state, &desktop).errors);
+    puts("PASS close to one, final-desktop protection, invalid requests, add after closing, and saved counts below four");
+}
+
+static void closing_failures_keep_recovery_tags(void)
+{
+    Desktop desktop = {0};
+    MSState state = start();
+    desktop.owner = open_window(&desktop, LEFT, true, true);
+    desktop.popup = open_window(&desktop, LEFT, true, true);
+    switch_to(&state, &desktop, LEFT, 3);
+    MSResult result;
+    /* Failure after the first retag rolls the group back before changing state. */
+    MSHandle group[] = {desktop.owner, desktop.popup};
+    assert(!move_group(&state, &desktop, LEFT, 4, group, 2).errors);
+    find(&desktop, desktop.popup)->eligible = false; /* Existing tags stay manageable. */
+    desktop.fail_tag = desktop.popup;
+    assert(!remove_space(&state, &desktop, LEFT, 2, &result) && result.errors == 1);
+    assert(ms_workspace_count(&state, LEFT) == 4 && ms_active(&state, LEFT) == 3);
+    assert(find(&desktop, desktop.owner)->tag == 4 && find(&desktop, desktop.popup)->tag == 4);
+    desktop.fail_undo = desktop.owner;
+    desktop.undo_tag = 4;
+    assert(!remove_space(&state, &desktop, LEFT, 2, &result) && result.errors == 2);
+    assert(ms_workspace_count(&state, LEFT) == 4);
+    assert(ms_valid_tag(find(&desktop, desktop.owner)->tag) && ms_valid_tag(find(&desktop, desktop.popup)->tag));
+    desktop.fail_undo = desktop.fail_tag = 0;
+    assert(!restore(&state, &desktop).errors);
+    find(&desktop, desktop.popup)->eligible = true;
+    switch_to(&state, &desktop, LEFT, 2);
+    desktop.fail_show = desktop.popup;
+    assert(remove_space(&state, &desktop, LEFT, 2, &result) && result.errors == 1);
+    assert(ms_workspace_count(&state, LEFT) == 3 && ms_active(&state, LEFT) == 1);
+    assert(find(&desktop, desktop.popup)->tag == 1 && !find(&desktop, desktop.popup)->visible);
+    desktop.fail_show = 0;
+    assert(!restore(&state, &desktop).errors);
+    switch_to(&state, &desktop, LEFT, 2);
+    desktop.fail_clear = desktop.owner;
+    assert(remove_space(&state, &desktop, LEFT, 2, &result) && result.errors == 1);
+    assert(find(&desktop, desktop.owner)->tag == 1 && ms_workspace_count(&state, LEFT) == 2);
+    desktop.fail_clear = 0;
+    assert(!restore(&state, &desktop).errors);
+    puts("PASS close failures roll back tags/count, failed rollback remains recoverable, failed reveal/clear retains membership");
+}
+
 int main(void)
 {
     independent_monitors_and_new_windows();
@@ -553,6 +695,9 @@ int main(void)
     move_groups_and_failures();
     expandable_workspace_counts();
     added_workspace_membership_and_recovery();
+    closing_workspaces_keeps_apps();
+    closing_down_to_one_workspace();
+    closing_failures_keep_recovery_tags();
     puts("All workspace simulations passed.");
     return 0;
 }

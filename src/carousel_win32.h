@@ -19,6 +19,7 @@ typedef struct {
     void (*activate)(MSHandle monitor, unsigned workspace);
     unsigned (*add)(MSHandle monitor, wchar_t *message, size_t capacity);
     void (*focus)(MSHandle monitor, MSHandle window, DWORD process);
+    bool (*remove)(MSHandle monitor, unsigned workspace, wchar_t *message, size_t capacity);
 } MSCarouselActions;
 
 bool ms_carousel_open(HINSTANCE instance, MSHandle monitor, const MSCarouselActions *actions);

@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #define MS_DEFAULT_WORKSPACES 4u
+#define MS_MIN_WORKSPACES 1u
 #define MS_MAX_WORKSPACES 99u
 #define MS_MAX_MONITORS 64u
 
@@ -64,5 +65,10 @@ void ms_restore(MSState *state, MSWindow *windows, size_t count,
  * All members are tagged before any owner can implicitly minimize its popups. */
 bool ms_move(const MSState *state, MSHandle monitor, unsigned destination,
              MSWindow *windows, size_t count, const MSOperations *ops, MSResult *result);
+/* Merge into the previous workspace (the next for workspace 1), then renumber.
+ * Tag writes are prepared before committing the count; failed writes roll back.
+ * A false return leaves the workspace open; recovery can retry any failed undo. */
+bool ms_remove_workspace(MSState *state, MSHandle monitor, unsigned workspace,
+                         MSWindow *windows, size_t count, const MSOperations *ops, MSResult *result);
 
 #endif

@@ -1,11 +1,11 @@
 # Verification
 
-Verified on 2026-11-22 using Linux-hosted tools. The GUI executable was inspected
+Verified on 2026-11-23 using Linux-hosted tools. The GUI executable was inspected
 without launching it on the host's Windows desktop.
 
 ## Automated checks completed
 
-`make test` compiles `src/workspaces.c` with the native C compiler and runs fourteen
+`make test` compiles `src/workspaces.c` with the native C compiler and runs seventeen
 workspace simulation scenarios against the same workspace engine linked into the GUI:
 
 1. Two monitors switch independently; a window opened in workspace 2 returns
@@ -40,11 +40,20 @@ workspace simulation scenarios against the same workspace engine linked into the
     move, and failed reveals remain tagged and can be retried.
 13. Monitors start with four spaces, grow independently, preserve their active
     workspace when adding, and wrap navigation through their configured counts.
-    Invalid saved counts, shrinking requests, and values above 99 are rejected. Recovery
+    Invalid counts, direct shrinking requests, and values above 99 are rejected. Recovery
     preserves counts, and a newly discovered monitor accepts a valid saved count.
 14. Apps opened in additional spaces retain membership, can move into extra
     spaces through the same engine used by the carousel, and remain independent
     of the other monitor. Tags 10 and 99 recover correctly even before counts load.
+15. Every combination of five active/closed desktops merges apps into the proper
+    neighbor and renumbers tags and active state without affecting the other
+    monitor. New apps, subsequent switches, and interrupted-run recovery still work.
+16. Closing desktops down to one preserves their apps, wraps navigation to itself,
+    rejects closing the final desktop and invalid requests, and supports adding
+    desktops again. Saved counts below the default can be loaded after recovery.
+17. Denied retagging rolls back before committing the count. Failed rollback
+    remains globally recoverable. Failed show/clear operations after a merge
+    leave valid recovery tags while the reduced count stays consistent.
 
 `make test` also compiles `src/navigation.c` and exercises input sequences for
 both Win keys, left/right navigation, Win+Up overview commands, repeat suppression, release order, overlapping
@@ -257,6 +266,23 @@ Use two physical displays and ordinary test windows with no unsaved work:
     group should move into it. Cancel outside +, test the 99-space limit, denied
     registry/property writes, and an app exiting during the drop. A failed move
     may leave the new empty space; recovery tags must still protect the app.
+    Hold a miniature desktop for 600 ms: an × should appear at its upper-right
+    corner, remain visible over live previews, and show the hand cursor on hover.
+    Release and click × to close it. Check first/middle/last, active/inactive,
+    empty/populated desktops, and owner/dialog groups. Apps must remain open and
+    move to the previous desktop (next when closing Desktop 1); other monitors
+    remain independent. Check renumbered labels, browsing selection, active dot,
+    tray number, paging, drag destinations, and navigation. Close down to one:
+    no × should be offered, and + must still work. Restart with counts 1–3.
+    An unavailable Ctrl+Alt+number must report it without resetting memberships.
+    Release before 600 ms, move beyond click tolerance, leave the card, switch
+    focus, scroll/page, press Escape, or lose capture before the hold completes:
+    no close button should appear later from a stale timer. Release of the
+    original hold must never close a desktop. Press × then release outside it
+    to cancel, and verify regular clicks, double-clicks, and app dragging still work.
+    Test mixed DPI, mouse-button swapping, denied property writes, save failures,
+    and an app closing during removal. Incomplete operations should report an
+    error and Ctrl+Alt+0 must still recover all remaining tagged apps.
 18. With the overview open, confirm the taskbar is covered until hovering at its
     screen edge, remains usable while the pointer is over it, and is covered
     again after moving away. Test normal and auto-hide taskbars, primary and
@@ -336,6 +362,9 @@ The Win+Up carousel's native painting, focus, drag capture, icons, and interacti
 also require live Windows validation; automated tests cover input and membership.
 The add-space control, paging/drag hover timer, registry persistence, monitor ID
 mapping, and multi-digit tray drawing also require live Windows validation.
+The desktop hold timer, close-button hit testing/capture, focus behavior during
+merges, and persistence of reduced counts also require live Windows validation;
+portable tests validate the removal/renumbering engine and recovery paths.
 The full-screen overview's DWM thumbnail rendering, explicit app activation,
 region-based taskbar reveal, auto-hide interaction, and persistent drawing buffer
 also require live Windows validation. Automated overview checks cover geometry.

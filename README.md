@@ -144,6 +144,14 @@ Click a desktop preview to browse its apps without switching your desktop. Scrol
 to reach more previews, click a preview to open that app, or double-click a
 desktop / click the wallpaper / press **Enter** to switch to the desktop being browsed. Plain
 Left/Right arrows browse workspaces inside the overview.
+To close a workspace, hold its miniature desktop preview for about **600 ms**.
+Release, then click the **×** that appears at its upper-right corner. Its apps move to
+the previous desktop, or to the next desktop when closing Desktop 1. Apps stay
+open, the remaining desktops are renumbered, and other monitors are unaffected.
+The active desktop stays selected unless it is the one being closed; in that
+case its neighbor becomes active. At least one desktop remains on each monitor.
+Releasing early, moving beyond the click tolerance, or losing mouse capture
+cancels the hold. Ordinary clicks still browse and double-clicks still switch.
 Click the **+** at the right of the strip to create another space on that monitor,
 up to 99. Drag a window onto **+** to create a space and move the window there in
 one gesture; if the move fails, the new empty space remains available.
@@ -151,6 +159,8 @@ Adding a space preserves the active workspace and all app assignments. Use
 the strip's **‹ / ›** arrows to browse additional desktops; while dragging an app, hover over an arrow
 for half a second to page without releasing it. Win+Left/Right cycles through
 every configured space, while Ctrl+Alt+1–4 retains the original direct shortcuts.
+If a numbered shortcut refers to a desktop you have closed, add more desktops
+with **+** to make that number available again.
 Drag an app preview onto a miniature desktop to move that app. Dropping onto an inactive
 workspace minimizes it there; dropping onto the active workspace restores it
 according to its saved state. Moving an app does not switch your current
@@ -186,8 +196,9 @@ organizes Monitor Spaces workspaces independently of Windows' own Win+Tab deskto
 Workspace counts are saved for the current Windows user under
 `HKEY_CURRENT_USER\Software\MonitorSpaces\WorkspaceCounts`, keyed by the monitor
 interface ID when available (otherwise its display name). Counts reload on launch
-and display reconfiguration. New monitors start with four; invalid saved values
-are ignored. If a count cannot be saved, the new space still works for that run
+and display reconfiguration, including counts reduced to one, two, or three.
+New monitors start with four; saved counts outside 1–99
+are ignored. If a count cannot be saved, the updated count still works for that run
 and the carousel reports the save failure. Restoring all windows resets the active
 workspace to 1 and preserves the configured counts. Window-to-workspace membership
 is not persisted across a restart; startup recovery brings all managed windows back.

@@ -21,7 +21,7 @@
 #include "app_icons_win32.h"
 
 static const wchar_t CAROUSEL_CLASS[] = L"MonitorSpaces.Carousel.v1";
-enum { VISIBLE_CARDS = 4, TIMER_DRAG_PAGE = 1, TIMER_TASKBAR };
+enum { VISIBLE_CARDS = 4, TIMER_DRAG_PAGE = 1, TIMER_TASKBAR, TIMER_WORKSPACE_HOLD, HOLD_MS = 600 };
 enum { WM_OVERVIEW_FRAME = WM_APP + 120 };
 typedef struct {
     HTHUMBNAIL handle, miniature;
@@ -41,6 +41,8 @@ typedef struct {
     Preview *previews;
     size_t count, pressed, hovered;
     unsigned active, view, spaces, first, dpi, drop, taskbar_edge, hover_space;
+    unsigned hold_space, close_space, pressed_close;
+    ULONGLONG hold_started;
     int scroll[MS_MAX_WORKSPACES], hover_page, taskbar_size;
     HFONT font, heading;
     HDC buffer;
@@ -116,6 +118,35 @@ static unsigned card_at(POINT point)
             return workspace;
     }
     return 0;
+}
+
+/* Sit just outside the upper-right edge so DWM thumbnails cannot cover it.
+ * The button fits in the existing gap between desktop previews. */
+static RECT workspace_close_rect(unsigned workspace)
+{
+    RECT rect = card_body(workspace);
+    rect.left = rect.right + scaled(2);
+    rect.top -= scaled(2);
+    rect.right = rect.left + scaled(20);
+    rect.bottom = rect.top + scaled(20);
+    return rect;
+}
+
+static unsigned workspace_close_at(POINT point)
+{
+    unsigned workspace = g_carousel.close_space;
+    if (over_taskbar(point) || g_carousel.spaces <= MS_MIN_WORKSPACES ||
+        !workspace || workspace > g_carousel.spaces ||
+        workspace <= g_carousel.first || workspace > g_carousel.first + VISIBLE_CARDS)
+        return 0;
+    RECT rect = workspace_close_rect(workspace);
+    return PtInRect(&rect, point) ? workspace : 0;
+}
+
+static void cancel_hold(void)
+{
+    KillTimer(g_carousel.window, TIMER_WORKSPACE_HOLD);
+    g_carousel.hold_space = 0;
 }
 
 static int workspace_count(unsigned workspace)
@@ -329,7 +360,7 @@ static bool refresh(void)
     }
     Preview *previews = calloc(count ? count : 1, sizeof(*previews));
     if (window != g_carousel.window || !previews || (count && !items) ||
-        spaces < MS_DEFAULT_WORKSPACES || spaces > MS_MAX_WORKSPACES || !active || active > spaces) {
+        spaces < MS_MIN_WORKSPACES || spaces > MS_MAX_WORKSPACES || !active || active > spaces) {
         free_snapshot(items, previews, count);
         if (window == g_carousel.window)
             g_carousel.busy = previous_busy;
@@ -451,6 +482,8 @@ static int page_at(POINT point)
 
 static void page(int direction)
 {
+    cancel_hold();
+    g_carousel.close_space = 0;
     unsigned last = g_carousel.spaces > VISIBLE_CARDS ? g_carousel.spaces - VISIBLE_CARDS : 0;
     if (direction < 0)
         g_carousel.first = g_carousel.first > VISIBLE_CARDS ? g_carousel.first - VISIBLE_CARDS : 0;
@@ -465,6 +498,8 @@ static void page(int direction)
 
 static void select_workspace(unsigned workspace)
 {
+    cancel_hold();
+    g_carousel.close_space = 0;
     if (!workspace || workspace > g_carousel.spaces)
         return;
     g_carousel.view = workspace;
@@ -575,6 +610,12 @@ static void paint(HDC dc, RECT client)
         caption.top = card.bottom + scaled(5);
         swprintf(text, 96, L"Desktop %u%ls", workspace, workspace == g_carousel.active ? L"  \x2022" : L"");
         label(dc, text, caption, RGB(251, 252, 255), DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (g_carousel.close_space == workspace && g_carousel.spaces > MS_MIN_WORKSPACES) {
+            RECT button = workspace_close_rect(workspace);
+            fill(dc, &button, workspace_close_at(g_carousel.pointer) == workspace ?
+                 RGB(183, 57, 65) : RGB(88, 51, 61));
+            label(dc, L"\x00d7", button, RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
     }
     if (!workspace_count(g_carousel.view)) {
         RECT empty = {scaled(40), strip_height(), client.right - scaled(40), client.bottom - scaled(70)};
@@ -840,6 +881,8 @@ bool ms_carousel_visible(void) { return g_carousel.window != NULL; }
 
 static void cancel_drag(void)
 {
+    cancel_hold();
+    g_carousel.pressed_close = 0;
     KillTimer(g_carousel.window, TIMER_DRAG_PAGE);
     g_carousel.hover_page = 0;
     g_carousel.pressed = SIZE_MAX;
@@ -925,6 +968,9 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
     }
     case WM_LBUTTONDBLCLK: {
         POINT point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        if (workspace_close_at(point))
+            return SendMessageW(window, WM_LBUTTONDOWN, wparam, lparam);
+        cancel_drag();
         unsigned workspace = card_at(point);
         if (workspace) {
             g_carousel.view = workspace;
@@ -938,6 +984,15 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
         finish_entrance();
         if (over_taskbar(point))
             return 0;
+        cancel_drag();
+        g_carousel.pointer = point;
+        unsigned closing = workspace_close_at(point);
+        if (closing) {
+            g_carousel.pressed_close = closing;
+            SetCapture(window);
+            return 0;
+        }
+        g_carousel.close_space = 0;
         RECT add = control_rect(0), close = control_rect(2);
         if (PtInRect(&close, point)) {
             ms_carousel_close();
@@ -967,6 +1022,14 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
         unsigned workspace = card_at(point);
         if (workspace) {
             select_workspace(workspace);
+            if (g_carousel.spaces > MS_MIN_WORKSPACES) {
+                g_carousel.origin = point;
+                g_carousel.hold_space = workspace;
+                g_carousel.hold_started = GetTickCount64();
+                SetCapture(window);
+                if (!SetTimer(window, TIMER_WORKSPACE_HOLD, HOLD_MS, NULL))
+                    cancel_hold();
+            }
             return 0;
         }
         if (hit == SIZE_MAX && point.y > strip_height()) {
@@ -988,6 +1051,15 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
         bool was_dragging = g_carousel.dragging;
         unsigned previous_drop = g_carousel.drop;
         g_carousel.pointer = point;
+        if (g_carousel.hold_space && (!(wparam & MK_LBUTTON) ||
+            abs(point.x - g_carousel.origin.x) >= GetSystemMetrics(SM_CXDRAG) ||
+            abs(point.y - g_carousel.origin.y) >= GetSystemMetrics(SM_CYDRAG) ||
+            card_at(point) != g_carousel.hold_space))
+            cancel_hold();
+        if (g_carousel.close_space) {
+            RECT button = workspace_close_rect(g_carousel.close_space);
+            InvalidateRect(window, &button, FALSE);
+        }
         RECT add = control_rect(0);
         bool hover_add = !over_taskbar(point) && PtInRect(&add, point) && g_carousel.spaces < MS_MAX_WORKSPACES;
         if (hover_add != g_carousel.hover_add) {
@@ -1048,12 +1120,43 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
     case WM_SETCURSOR:
         if (LOWORD(lparam) == HTCLIENT) {
             SetCursor(LoadCursorW(NULL, g_carousel.dragging ? IDC_SIZEALL :
-                g_carousel.hovered < g_carousel.count || g_carousel.hover_space || g_carousel.hover_add ? IDC_HAND : IDC_ARROW));
+                g_carousel.hovered < g_carousel.count || g_carousel.hover_space || g_carousel.hover_add ||
+                workspace_close_at(g_carousel.pointer) ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
         break;
     case WM_LBUTTONUP: {
         POINT point = {GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        unsigned closing = g_carousel.pressed_close;
+        if (closing) {
+            bool remove = workspace_close_at(point) == closing;
+            cancel_drag();
+            if (remove) {
+                unsigned old_view = g_carousel.view;
+                g_carousel.busy = true;
+                bool removed = g_carousel.actions.remove(g_carousel.monitor, closing, g_carousel.message, 256);
+                if (window != g_carousel.window)
+                    return 0;
+                g_carousel.close_space = 0;
+                if (removed) {
+                    g_carousel.view = old_view >= closing && old_view > 1 ? old_view - 1 : old_view;
+                    for (unsigned i = closing; i < g_carousel.spaces; ++i)
+                        g_carousel.scroll[i - 1] = g_carousel.scroll[i];
+                    g_carousel.scroll[g_carousel.spaces - 1] = 0;
+                }
+                if (!refresh()) {
+                    /* Never leave stale numbered controls active after a close. */
+                    ms_carousel_close();
+                    return 0;
+                }
+                select_workspace(g_carousel.view);
+                g_carousel.busy = false;
+                SetForegroundWindow(window);
+                SetFocus(window);
+                InvalidateRect(window, NULL, FALSE);
+            }
+            return 0;
+        }
         unsigned destination = card_at(point);
         size_t pressed = g_carousel.pressed;
         RECT add = control_rect(0);
@@ -1093,6 +1196,8 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
         return 0;
     }
     case WM_CAPTURECHANGED:
+        cancel_hold();
+        g_carousel.pressed_close = 0;
         KillTimer(window, TIMER_DRAG_PAGE);
         g_carousel.hover_page = 0;
         g_carousel.pressed = SIZE_MAX;
@@ -1103,6 +1208,22 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
     case WM_TIMER:
         if (wparam == TIMER_TASKBAR)
             update_taskbar();
+        else if (wparam == TIMER_WORKSPACE_HOLD && g_carousel.hold_space &&
+                 GetTickCount64() - g_carousel.hold_started >= HOLD_MS) {
+            POINT point;
+            int button = GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON;
+            bool held = GetCapture() == window && (GetAsyncKeyState(button) & 0x8000) &&
+                GetCursorPos(&point) && ScreenToClient(window, &point) &&
+                card_at(point) == g_carousel.hold_space &&
+                abs(point.x - g_carousel.origin.x) < GetSystemMetrics(SM_CXDRAG) &&
+                abs(point.y - g_carousel.origin.y) < GetSystemMetrics(SM_CYDRAG);
+            if (held) {
+                g_carousel.close_space = g_carousel.hold_space;
+                wcscpy(g_carousel.message, L"Release, then click \x00d7 to close this desktop and keep its apps on a neighbor.");
+            }
+            cancel_hold();
+            InvalidateRect(window, NULL, FALSE);
+        }
         else if (wparam == TIMER_DRAG_PAGE && g_carousel.dragging && g_carousel.hover_page) {
             if (can_page(g_carousel.hover_page))
                 page(g_carousel.hover_page);
@@ -1115,6 +1236,8 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
     case WM_CANCELMODE: cancel_drag(); return 0;
     case WM_MOUSEWHEEL:
         finish_entrance();
+        if (g_carousel.hold_space)
+            cancel_drag();
         if (g_carousel.view) {
             g_carousel.scroll[g_carousel.view - 1] += GET_WHEEL_DELTA_WPARAM(wparam) > 0 ? -1 : 1;
             MSOverviewGrid layout = grid();
@@ -1124,6 +1247,8 @@ static LRESULT CALLBACK carousel_proc(HWND window, UINT message, WPARAM wparam, 
         return 0;
     case WM_KEYDOWN:
         finish_entrance();
+        if (g_carousel.hold_space || g_carousel.pressed_close)
+            cancel_drag();
         if (wparam == VK_ESCAPE)
             ms_carousel_close();
         else if (wparam == VK_RETURN && !g_carousel.dragging)
@@ -1204,7 +1329,7 @@ bool ms_carousel_open(HINSTANCE instance, MSHandle monitor, const MSCarouselActi
     prepare_backdrop();
     if (window != g_carousel.window)
         return false;
-    wcscpy(g_carousel.message, L"Drag windows to a desktop or + to create one. Enter switches desktop. Esc returns.");
+    wcscpy(g_carousel.message, L"Drag windows to a desktop or +. Hold a desktop to reveal \x00d7. Enter switches. Esc returns.");
     if (!g_carousel.font || !g_carousel.heading || !refresh()) {
         ms_carousel_close();
         return false;
